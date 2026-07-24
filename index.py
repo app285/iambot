@@ -16,10 +16,6 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Vercel uchun vaqtinchalik xotira (Dictionary)
-# ESLATMA: Vercel serverless funksiyalari statik xotiraga ega emas —
-# har requestda yangi instance ishga tushishi mumkin va bu dictionary
-# tozalanib ketishi mumkin. Doimiy xotira kerak bo'lsa, Redis (masalan
-# Upstash) yoki boshqa tashqi bazadan foydalaning.
 chat_histories = {}
 MAX_HISTORY_LENGTH = 10
 
@@ -29,13 +25,10 @@ chat_moods = {}
 # Business ulanishlar bo'yicha akkaunt egasining user_id sini keshlash
 business_owner_ids = {}
 
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
 
 
 def get_business_owner_id(business_connection_id):
-    """Business ulanishga tegishli akkaunt egasining Telegram user_id sini qaytaradi.
-    is_self/is_outgoing maydonlari business xabarlarida ishonchli kelmasligi mumkin,
-    shuning uchun xabar egadan kelganini shu ID orqali tekshiramiz."""
     if business_connection_id in business_owner_ids:
         return business_owner_ids[business_connection_id]
 
@@ -103,7 +96,7 @@ def get_ai_answer(chat_id, user_message_content):
         elif current_mood == "jiddiy":
             mood_instruction = "\n- KAYFIYAT REJIMI: Juda jiddiy va qisqa javob ber."
 
-       system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy AI-yordamchisisan. Akkaunt egasi hozir band bo'lgani uchun, unga yozganlarga SEN javob berasan — lekin buni ochiq aytmasdan, xuddi tabiiy suhbatdoshdek erkin gaplashasan.
+        system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy AI-yordamchisisan. Akkaunt egasi hozir band bo'lgani uchun, unga yozganlarga SEN javob berasan — lekin buni ochiq aytmasdan, xuddi tabiiy suhbatdoshdek erkin gaplashasan.
 
 AKKAUNT EGASI HAQIDA MA'LUMOT:
 - Ismi: Shaxboz
@@ -126,6 +119,7 @@ MULOQOT USLUBI:
 - Suhbatdosh qaysi tilda yozsa, javobni FAQAT o'sha tilda ber (o'zbek, ingliz, rus va h.k.). Tillarni aralashtirma.
 - Agar suhbatdosh o'zbek tilida **lotin** alifbosida yozsa — sen ham lotincha yoz.
 - Agar suhbatdosh o'zbek tilida **kirill** alifbosida yozsa — sen ham kirillcha alifboda javob qaytar."""
+
         messages_payload = [{"role": "system", "content": system_prompt}] + chat_histories[chat_id]
 
         chat_completion = groq_client.chat.completions.create(
@@ -139,7 +133,9 @@ MULOQOT USLUBI:
 
         return answer
     except Exception as e:
-        print("Groq xatolik:", e)
+        import traceback
+        traceback.print_exc()  # Terminalda xatolikni aniq ko'rsatadi
+        print("Groq xatolik tafsiloti:", e)
         return "Keyinroq yozvoraman."
 
 
@@ -151,8 +147,6 @@ def webhook():
     try:
         data = request.get_json(force=True)
 
-        # Telegram business ulanish o'rnatilganda/yangilanganda shu update keladi —
-        # bu yerdan akkaunt egasining user_id sini ishonchli tarzda, API chaqirmasdan olamiz.
         if "business_connection" in data:
             bc = data["business_connection"]
             bc_id = bc.get("id")
@@ -171,14 +165,10 @@ def webhook():
         else:
             return "OK", 200
 
-        # HIMOYA: Xabar o'zingizdan chiqqan bo'lsa botni to'xtatish
         sender_id = message.get("from", {}).get("id")
 
         if business_connection_id:
             owner_id = get_business_owner_id(business_connection_id)
-            print(f"DEBUG: business_connection_id={business_connection_id}, owner_id={owner_id}, sender_id={sender_id}")
-            if owner_id is None:
-                print("OGOHLANTIRISH: owner_id topilmadi — botni to'xtata olmayapmiz, owner o'zi yozsa ham javob beradi!")
             if owner_id and sender_id == owner_id:
                 return "OK", 200
         else:
@@ -219,8 +209,9 @@ def webhook():
 
             if file_url:
                 try:
+                    # Vision uchun ham barqaror model ishlatamiz
                     vision_completion = groq_client.chat.completions.create(
-                        model="meta-llama/llama-4-scout-17b-16e-instruct",
+                        model="llama-3.2-11b-vision-preview",
                         messages=[
                             {
                                 "role": "user",
