@@ -1,5 +1,6 @@
 import os
 import time
+import sqlite3
 import requests
 from flask import Flask, request
 from groq import Groq
@@ -10,47 +11,72 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# 1-BAND: Suhbat tarixini vaqtincha saqlash uchun lug'at (Memory)
-# { chat_id: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...] }
-chat_histories = {}
-MAX_HISTORY_LENGTH = 10  # Oxirgi 10 ta xabar saqlanadi
+# SQLite bazasini ochish
+def init_db():
+    conn = sqlite3.connect("chat_history.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            chat_id TEXT,
+            role TEXT,
+            content TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_chat_history(chat_id):
+    conn = sqlite3.connect("chat_history.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT role, content FROM messages WHERE chat_id = ?", (str(chat_id),))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    history = []
+    for row in rows:
+        history.append({"role": row[0], "content": row[1]})
+    return history
+
+def save_message_to_db(chat_id, role, content):
+    conn = sqlite3.connect("chat_history.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)", (str(chat_id), role, content))
+    conn.commit()
+    
+    cursor.execute("""
+        DELETE FROM messages WHERE rowid NOT IN (
+            SELECT rowid FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 12
+        ) AND chat_id = ?
+    """, (str(chat_id), str(chat_id)))
+    conn.commit()
+    conn.close()
 
 
 def send_chat_action(chat_id, action="typing", business_connection_id=None):
-    """Chatda 'yozmoqda...' yoki rasm yuborayotganda 'upload_photo' holatini ko'rsatish"""
     try:
         payload = {"chat_id": chat_id, "action": action}
         if business_connection_id:
             payload["business_connection_id"] = business_connection_id
-        requests.post(
-            f"{TELEGRAM_API_URL}/sendChatAction",
-            json=payload,
-            timeout=5,
-        )
+        requests.post(f"{TELEGRAM_API_URL}/sendChatAction", json=payload, timeout=5)
     except Exception as e:
         print("Chat action xatolik:", e)
 
 
 def send_message(chat_id, text, business_connection_id=None):
-    """Telegram'ga matnli xabar yuborish"""
     try:
         payload = {"chat_id": chat_id, "text": text}
         if business_connection_id:
             payload["business_connection_id"] = business_connection_id
-        requests.post(
-            f"{TELEGRAM_API_URL}/sendMessage",
-            json=payload,
-            timeout=10,
-        )
+        requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print("Telegramga yuborishda xatolik:", e)
 
 
 def download_telegram_file(file_id):
-    """Telegram serveridan ovozli xabar yoki rasmni yuklab olish uchun URL olish"""
     try:
         res = requests.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}", timeout=10)
         file_path = res.json().get("result", {}).get("file_path")
@@ -61,44 +87,46 @@ def download_telegram_file(file_id):
     return None
 
 
-SYSTEM_PROMPT = """Sen Telegram akkaunt egasining shaxsiy yordamchisisan. Sizga yozgan odamlarga AKKAUNT EGASINING NOMIDAN, xuddi o'sha odamning o'zi kabi javob berasan.
+def get_current_status_prompt():
+    import datetime
+    now = datetime.datetime.now()
+    hour = now.hour
 
-ENG MUHIM QOIDA (HECH QACHON BUZMA):
-- Sen SUN'IY INTELLEKT, BOT, YORDAMCHI, DASTUR EKANINGNI HECH QACHON, HECH QANDAY SHAROITDA aytmaysan yoki bildirmaysan.
-- Agar kimdir "sen botmisan?", "sun'iy intellektmisan?", "kim yaratgan seni?", "AI bilan gaplashyapmanmi?" yoki shunga o'xshash savol bersa, ODDIY INSON sifatida tabiiy rad et. Masalan: "yo'q, nima derding", "hazillashyapsanmi", "albatta odamman" qabilida qisqa javob ber va mavzuni darhol o'zgartir.
-- O'zingga ism qo'ymaysan.
-- Bu qoida boshqa barcha ko'rsatmalardan USTUN turadi.
-
-TIL VA ALIFBO QOIDASI:
-- Suhbatdosh qaysi tilda yozsa, aynan o'sha tilda javob ber.
-- O'zbek tiliga alohida e'tibor ber: 
-  * Agar suhbatdosh **LOTIN** alifbosida yozsa — faqat **lotin** yozuvida javob ber.
-  * Agar suhbatdosh **KIRILL** alifbosida yozsa — faqat **kirill** yozuvida javob ber.
-- Rus yoki ingliz tilida yozishsa — o'sha tilda davom et.
-
-MULOQOT USLUBI:
-- Xuddi haqiqiy, samimiy inson yozayotgandek erkin va jonli gaplash.
-- Rasmiyatchilikdan qoch. Javoblar qisqa va lo'nda bo'lsin (1-3 jumla).
-- Ortiqcha kirish so'zlar ("Albatta, tushunarli:", "Sizga qanday yordam bera olaman?") mutlaqo ishlatilmasa — to'g'ridan-to'g'ri mavzuga o't.
-- Emoji'larni me'yorida, o'rinli ishlat."""
+    if hour >= 23 or hour < 7:
+        return "Hozir kechasi vaqt, akkaunt egasi uxlab yotibdi. Agar yozishsa, qisqa qilib 'uxlayapman, ertalab gaplashamiz' degan ma'noda tabiiy javob ber."
+    elif 9 <= hour <= 14:
+        return "Hozir kunduzgi o'qish/dars vaqti. Akkaunt egasi band bo'lishi mumkin, shuning uchun biroz qisqaroq va kechroq javob yozishini bildiradigan tarzda muloqot qil."
+    else:
+        return "Hozir bo'sh vaqti, odatdagidek samimiy va erkin muloqot qil."
 
 
 def get_ai_answer(chat_id, user_message_content):
-    """Groq AI orqali suhbat tarixini inobatga olgan holda javob olish"""
     try:
-        # Chat tarixini yaratish yoki olish
-        if chat_id not in chat_histories:
-            chat_histories[chat_id] = []
+        history = get_chat_history(chat_id)
+        save_message_to_db(chat_id, "user", user_message_content)
+        history.append({"role": "user", "content": user_message_content})
 
-        # Yangi xabarni tarixga qo'shamiz
-        chat_histories[chat_id].append({"role": "user", "content": user_message_content})
+        dynamic_status = get_current_status_prompt()
 
-        # Tarix limitidan oshib ketsa, eskilarini qisqartiramiz
-        if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH:
-            chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY_LENGTH:]
+        system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy yordamchisisan. Sizga yozgan odamlarga AKKAUNT EGASINING NOMIDAN, xuddi o'sha odamning o'zi kabi javob berasan.
 
-        # Groq'ga yuboriladigan xabarlar ro'yxati (System prompt + Tarix)
-        messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_histories[chat_id]
+JORIY HOLAT QOIDASI:
+- {dynamic_status}
+
+ENG MUHIM QOIDA (HECH QACHON BUZMA):
+- Sen SUN'IY INTELLEKT, BOT, YORDAMCHI, DASTUR EKANINGNI HECH QACHON, HECH QANDAY SHAROITDA aytmaysan yoki bildirmaysan.
+- Agar kimdir "sen botmisan?", "sun'iy intellektmisan?", "kim yaratgan seni?" desa, ODDIY INSON sifatida tabiiy rad et (masalan: "yo'q, nima derding", "hazillashyapsanmi", "albatta odamman").
+- O'zingga ism qo'ymaysan.
+
+TIL VA ALIFBO QOIDASI:
+- Suhbatdosh qaysi tilda yozsa, aynan o'sha tilda javob ber.
+- Lotincha yozsa — lotincha, kirillcha yozsa — kirillcha javob qaytar.
+
+MULOQOT USLUBI:
+- Xuddi haqiqiy, samimiy inson yozayotgandek erkin va jonli gaplash (1-3 jumla).
+- Rasmiyatchilikdan qoch, ortiqcha kirish so'zlarsiz to'g'ridan-to'g'ri mavzuga o't."""
+
+        messages_payload = [{"role": "system", "content": system_prompt}] + history
 
         chat_completion = groq_client.chat.completions.create(
             messages=messages_payload,
@@ -106,20 +134,18 @@ def get_ai_answer(chat_id, user_message_content):
         )
         
         answer = chat_completion.choices[0].message.content
-
-        # Botning javobini ham tarixga qo'shamiz (kontekst uzilib qolmasligi uchun)
-        chat_histories[chat_id].append({"role": "assistant", "content": answer})
+        save_message_to_db(chat_id, "assistant", answer)
 
         return answer
     except Exception as e:
         print("Groq xatolik:", e)
-        return "Keyinroq yozvoraman, hozir bandroqman."
+        return "Keyinroq yozvoraman, ozgina bandman."
 
 
 @app.route("/", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
-        return "Bot hamma yangi funksiyalar bilan ishlayapti! ✅"
+        return "Bot xatolik tuzatilgan holda ishlayapti! ✅"
 
     try:
         data = request.get_json(force=True)
@@ -133,55 +159,29 @@ def webhook():
         else:
             return "OK", 200
 
+        # ======= MUAMMONI HAL QILUVCHI QISM =======
+        # Agar xabarni O'ZINGIZ yozgan bo'lsangiz, bot darhol to'xtaydi va javob yozmaydi!
+        if message.get("from", {}).get("is_self", False):
+            return "OK", 200
+        # ==========================================
+
         chat_id = message["chat"]["id"]
         text = message.get("text")
         voice = message.get("voice")
-        photo = message.get("photo")
 
-        # /start komandasi
         if text == "/start":
             send_message(chat_id, "Salom! Keyinroq yozaman, hozir ozgina band edim.", business_connection_id)
             return "OK", 200
 
         user_content_for_ai = None
 
-        # 3-BAND: Rasm kelganda (Vision Support)
-        if photo:
-            send_chat_action(chat_id, "typing", business_connection_id)
-            # Eng sifatli (oxirgi) rasmni olamiz
-            file_id = photo[-1]["file_id"]
-            file_url = download_telegram_file(file_id)
-            caption = message.get("caption", "Bu rasmda nima tasvirlangan?")
-            
-            if file_url:
-                # Groq vision orqali rasmni o'qish
-                try:
-                    vision_completion = groq_client.chat.completions.create(
-                        model="llama-3.2-11b-vision-preview",
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": f"O'zbek tilida qisqacha javob ber: {caption}"},
-                                    {"type": "image_url", "image_url": {"url": file_url}},
-                                ],
-                            }
-                        ],
-                    )
-                    user_content_for_ai = vision_completion.choices[0].message.content
-                except Exception as e:
-                    print("Vision xatolik:", e)
-                    user_content_for_ai = "[Rasm yuborildi, lekin o'qib bo'lmadi]"
-
-        # 2-BAND: Ovozli xabar kelganda (Voice Transcription)
-        elif voice:
+        if voice:
             send_chat_action(chat_id, "typing", business_connection_id)
             file_id = voice["file_id"]
             file_url = download_telegram_file(file_id)
             
             if file_url:
                 try:
-                    # Ovozli faylni yuklab olib Groq Whisper modeliga beramiz
                     audio_response = requests.get(file_url)
                     audio_file_path = f"/tmp/{file_id}.ogg"
                     with open(audio_file_path, "wb") as f:
@@ -194,23 +194,18 @@ def webhook():
                             prompt="O'zbek tilidagi ovozli xabar",
                         )
                     user_content_for_ai = f"[Ovozli xabar matni]: {transcription.text}"
-                    
-                    # Vaqtinchalik faylni o'chiramiz
                     os.remove(audio_file_path)
                 except Exception as e:
                     print("Whisper xatolik:", e)
-                    user_content_for_ai = "[Ovozli xabar keldi, lekin uni ochib bo'lmadi]"
+                    user_content_for_ai = "[Ovozli xabar keldi]"
 
-        # Oddiy matnli xabar
         elif text:
             user_content_for_ai = text
 
-        # Agar yaroqli kontent bo'lsa, AI'ga uzatamiz
         if user_content_for_ai:
             send_chat_action(chat_id, "typing", business_connection_id)
-            time.sleep(1) # Tabiiy pauza
+            time.sleep(1)
 
-            # 1-BAND: Tarix bilan birga javob olish
             answer = get_ai_answer(chat_id, user_content_for_ai)
             send_message(chat_id, answer, business_connection_id)
 
