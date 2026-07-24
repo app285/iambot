@@ -26,7 +26,33 @@ MAX_HISTORY_LENGTH = 10
 # Kayfiyat rejimlari uchun xotira
 chat_moods = {}
 
+# Business ulanishlar bo'yicha akkaunt egasining user_id sini keshlash
+business_owner_ids = {}
+
 REQUEST_TIMEOUT = 10
+
+
+def get_business_owner_id(business_connection_id):
+    """Business ulanishga tegishli akkaunt egasining Telegram user_id sini qaytaradi.
+    is_self/is_outgoing maydonlari business xabarlarida ishonchli kelmasligi mumkin,
+    shuning uchun xabar egadan kelganini shu ID orqali tekshiramiz."""
+    if business_connection_id in business_owner_ids:
+        return business_owner_ids[business_connection_id]
+
+    try:
+        res = requests.get(
+            f"{TELEGRAM_API_URL}/getBusinessConnection",
+            params={"business_connection_id": business_connection_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        owner = res.json().get("result", {}).get("user", {})
+        owner_id = owner.get("id")
+        if owner_id:
+            business_owner_ids[business_connection_id] = owner_id
+        return owner_id
+    except Exception as e:
+        print("Business connection ma'lumotini olishda xatolik:", e)
+        return None
 
 
 def send_chat_action(chat_id, action="typing", business_connection_id=None):
