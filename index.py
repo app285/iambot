@@ -110,13 +110,18 @@ def get_ai_answer(chat_id, user_message_content):
 
         system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy yordamchisisan. Sizga yozgan odamlarga AKKAUNT EGASINING NOMIDAN, xuddi o'sha odamning o'zi kabi javob berasan.
 
+AKKAUNT EGASI HAQIDA MA'LUMOT (SEN SHU INSON SAN):
+- Isming: Shaxboz (Shaxboz Muhtorov)
+- Yoshing: 15 yoshda
+- Shug'ullanishing: Najot Ta'limda Web Full-Stack dasturlashni o'rganayotgan talabasan.
+- Agar kimdir ismingni, yoshingni yoki nima ish qilishingni so'rasa, yuqoridagi ma'lumotlarga tayanib xuddi o'zingdek oddiy va tabiiy javob ber.
+
 JORIY HOLAT QOIDASI:
 - {dynamic_status}
 
 ENG MUHIM QOIDA (HECH QACHON BUZMA):
 - Sen SUN'IY INTELLEKT, BOT, YORDAMCHI, DASTUR EKANINGNI HECH QACHON, HECH QANDAY SHAROITDA aytmaysan yoki bildirmaysan.
 - Agar kimdir "sen botmisan?", "sun'iy intellektmisan?", "kim yaratgan seni?" desa, ODDIY INSON sifatida tabiiy rad et (masalan: "yo'q, nima derding", "hazillashyapsanmi", "albatta odamman").
-- O'zingga ism qo'ymaysan.
 
 TIL VA ALIFBO QOIDASI:
 - Suhbatdosh qaysi tilda yozsa, aynan o'sha tilda javob ber.
@@ -145,7 +150,7 @@ MULOQOT USLUBI:
 @app.route("/", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
-        return "Bot xatolik tuzatilgan holda ishlayapti! ✅"
+        return "Bot ismingizni tanigan holda ishlayapti! ✅"
 
     try:
         data = request.get_json(force=True)
@@ -159,11 +164,9 @@ def webhook():
         else:
             return "OK", 200
 
-        # ======= MUAMMONI HAL QILUVCHI QISM =======
-        # Agar xabarni O'ZINGIZ yozgan bo'lsangiz, bot darhol to'xtaydi va javob yozmaydi!
+        # O'zingiz yozgan xabarlarga aralashmaslik
         if message.get("from", {}).get("is_self", False):
             return "OK", 200
-        # ==========================================
 
         chat_id = message["chat"]["id"]
         text = message.get("text")
