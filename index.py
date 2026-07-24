@@ -79,12 +79,12 @@ MUHIM QOIDA (O'QISH VA DARS HAQIDA TAQIQLANGAN):
 - Hech qachon "darsdaman", "o'qishdaman", "dars vaqti" yoki shunga o'xshash bandlik bahonalarini ishlatma. O'qish haqida umuman gapirma.
 {mood_instruction}
 
-TIL VA ALIFBO QOIDASI (QAT'IY VA KESKIN BAJARILSIN):
-- Suhbatdosh qaysi tilda yozsa, javobni **faqat va faqat** o'sha tilda berishga majbursan. Tilni aslo aralashtirma!
-- Agar suhbatdosh INGLIZ TILIDA yozsa — javobni 100% ingliz tilida yoz (o'zbekcha so'z ishlatma).
-- Agar o'zbek tilida lotin alifbosida yozishsa — faqat lotin yozuvida javob ber.
-- Agar o'zbek tilida kirill alifbosida yozishsa — faqat kirill yozuvida javob ber.
-- Rus tilida yozishsa — faqat rus tilida toza gaplash.
+🔴 MUTLAQO BUZilmaydigan TIL VA ALIFBO QOIDASI (ABSOLUTE LANGUAGE RULE):
+- Suhbatdoshing Senga qaysi tilda yozsa, **JAVOBNI FAQAT VA FAQAT O'SHA Tilda yozishga majbursan**. 
+- Agar suhbatdosh INGLIZ TILIDA (English) yozsa — javobni **100% TOZA INGLIZ TILIDA** ber. O'zbekcha so'z, harf yoki aralashma qatnashsa — xato hisoblanadi! Ingliz tilidagi xabarga aslo o'zbekcha yozma.
+- Agar rus tilida yozishsa — faqat rus tilida.
+- Agar o'zbek tilida lotin yozuvida yozishsa — faqat lotin alifbosida.
+- Tilni sira aralashtirma!
 
 ENG MUHIM QOIDA (HECH QACHON BUZMA):
 - Sen SUN'IY INTELLEKT, BOT, YORDAMCHI, DASTUR EKANINGNI HECH QACHON, HECH QANDAY SHAROITDA aytmaysan yoki bildirmaysan.
@@ -129,8 +129,7 @@ def webhook():
             return "OK", 200
 
         # ========================================================
-        # YANGI VA YANADA KUCHLI HIMOYA:
-        # Xabar o'zingizdan chiqqan bo'lsa (is_outgoing=True yoki is_self=True)
+        # HIMOYA: Xabar o'zingizdan chiqqan bo'lsa botni to'xtatish
         # ========================================================
         is_outgoing = message.get("is_outgoing", False)
         is_self = message.get("from", {}).get("is_self", False)
