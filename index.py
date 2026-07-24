@@ -126,12 +126,23 @@ def webhook():
         else:
             return "OK", 200
 
-        # ========================================================
-        # ENG MUHIM HIMoya: Agar xabarni O'ZINGIZ yozgan bo'lsangiz, 
-        # bot darhol to'xtaydi va aslo aralashmaydi!
+      if "business_message" in data:
+            message = data["business_message"]
+            business_connection_id = message.get("business_connection_id")
+        elif "message" in data:
+            message = data["message"]
+            business_connection_id = None
+        else:
+            return "OK", 200
+
+        # ==========================================
+        # MANA SHU YERGA QO'YASIZ (Eng birinchi bo'lib):
         if message.get("from", {}).get("is_self", False):
             return "OK", 200
-        # ========================================================
+        # ==========================================
+
+        chat_id = message["chat"]["id"]
+        text = message.get("text")
 
         chat_id = message["chat"]["id"]
         text = message.get("text")
