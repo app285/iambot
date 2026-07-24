@@ -13,8 +13,9 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# SQLite bazasini ochish
+# ==================== 3-BAND: SQLITE BAZA ORQALI XOTIRANI SAQLASH ====================
 def init_db():
+    """Foydalanuvchilar suhbat tarixini doimiy saqlash uchun baza ochish"""
     conn = sqlite3.connect("chat_history.db")
     cursor = conn.cursor()
     cursor.execute("""
@@ -30,6 +31,7 @@ def init_db():
 init_db()
 
 def get_chat_history(chat_id):
+    """Bazadan chat tarixini olish"""
     conn = sqlite3.connect("chat_history.db")
     cursor = conn.cursor()
     cursor.execute("SELECT role, content FROM messages WHERE chat_id = ?", (str(chat_id),))
@@ -42,11 +44,13 @@ def get_chat_history(chat_id):
     return history
 
 def save_message_to_db(chat_id, role, content):
+    """Bazaga yangi xabarni qo'shish va 10 tadan oshigini o'chirish"""
     conn = sqlite3.connect("chat_history.db")
     cursor = conn.cursor()
     cursor.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)", (str(chat_id), role, content))
     conn.commit()
     
+    # Tarix juda uzun bo'lib ketmasligi uchun faqat oxirgi 12 ta xabarni saqlaymiz
     cursor.execute("""
         DELETE FROM messages WHERE rowid NOT IN (
             SELECT rowid FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 12
@@ -54,9 +58,11 @@ def save_message_to_db(chat_id, role, content):
     """, (str(chat_id), str(chat_id)))
     conn.commit()
     conn.close()
+# ====================================================================================
 
 
 def send_chat_action(chat_id, action="typing", business_connection_id=None):
+    """Chatda 'yozmoqda...' holatini ko'rsatish"""
     try:
         payload = {"chat_id": chat_id, "action": action}
         if business_connection_id:
@@ -67,6 +73,7 @@ def send_chat_action(chat_id, action="typing", business_connection_id=None):
 
 
 def send_message(chat_id, text, business_connection_id=None):
+    """Telegram'ga matnli xabar yuborish"""
     try:
         payload = {"chat_id": chat_id, "text": text}
         if business_connection_id:
@@ -77,6 +84,7 @@ def send_message(chat_id, text, business_connection_id=None):
 
 
 def download_telegram_file(file_id):
+    """Telegram serveridan fayl URL manzilini olish"""
     try:
         res = requests.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}", timeout=10)
         file_path = res.json().get("result", {}).get("file_path")
@@ -87,25 +95,35 @@ def download_telegram_file(file_id):
     return None
 
 
+# ==================== 4-BAND: AVTOMATLASHGAN REJIM VA HOLATLAR ====================
 def get_current_status_prompt():
+    """Vaqtga qarab eganing holatini aniqlash (Masalan, tun yoki dars vaqti)"""
     import datetime
     now = datetime.datetime.now()
     hour = now.hour
 
+    # Kechasi (23:00 dan 07:00 gacha)
     if hour >= 23 or hour < 7:
-        return "Hozir kechasi vaqt, akkaunt egasi uxlab yotibdi. Agar yozishsa, qisqa qilib 'uxlayapman, ertalab gaplashamiz' degan ma'noda tabiiy javob ber."
+        return "Hozir kekasi vaqt, akkaunt egasi uxlab yotibdi. Agar yozishsa, qisqa qilib 'uxlayapman, ertalab gaplashamiz' degan ma'noda tabiiy javob ber."
+    # Kunduzi o'qish/dars vaqti (masalan, 09:00 dan 14:00 gacha)
     elif 9 <= hour <= 14:
         return "Hozir kunduzgi o'qish/dars vaqti. Akkaunt egasi band bo'lishi mumkin, shuning uchun biroz qisqaroq va kechroq javob yozishini bildiradigan tarzda muloqot qil."
     else:
         return "Hozir bo'sh vaqti, odatdagidek samimiy va erkin muloqot qil."
+# ====================================================================================
 
 
 def get_ai_answer(chat_id, user_message_content):
+    """Groq AI orqali doimiy bazadagi tarix va holatni inobatga olib javob olish"""
     try:
+        # Bazadan tarixni olamiz
         history = get_chat_history(chat_id)
+        
+        # Yangi xabarni bazaga yozamiz
         save_message_to_db(chat_id, "user", user_message_content)
         history.append({"role": "user", "content": user_message_content})
 
+        # Dinamik holat promptini qo'shamiz
         dynamic_status = get_current_status_prompt()
 
         system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy yordamchisisan. Sizga yozgan odamlarga AKKAUNT EGASINING NOMIDAN, xuddi o'sha odamning o'zi kabi javob berasan.
@@ -134,6 +152,8 @@ MULOQOT USLUBI:
         )
         
         answer = chat_completion.choices[0].message.content
+
+        # Botning javobini ham bazaga saqlaymiz
         save_message_to_db(chat_id, "assistant", answer)
 
         return answer
@@ -145,7 +165,7 @@ MULOQOT USLUBI:
 @app.route("/", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
-        return "Bot xatolik tuzatilgan holda ishlayapti! ✅"
+        return "Bot SQLite xotira va avtomat rejim bilan ishlayapti! ✅"
 
     try:
         data = request.get_json(force=True)
@@ -159,12 +179,6 @@ def webhook():
         else:
             return "OK", 200
 
-        # ======= MUAMMONI HAL QILUVCHI QISM =======
-        # Agar xabarni O'ZINGIZ yozgan bo'lsangiz, bot darhol to'xtaydi va javob yozmaydi!
-        if message.get("from", {}).get("is_self", False):
-            return "OK", 200
-        # ==========================================
-
         chat_id = message["chat"]["id"]
         text = message.get("text")
         voice = message.get("voice")
@@ -175,6 +189,7 @@ def webhook():
 
         user_content_for_ai = None
 
+        # Ovozli xabarni matnga o'girish (Whisper)
         if voice:
             send_chat_action(chat_id, "typing", business_connection_id)
             file_id = voice["file_id"]
@@ -204,7 +219,7 @@ def webhook():
 
         if user_content_for_ai:
             send_chat_action(chat_id, "typing", business_connection_id)
-            time.sleep(1)
+            time.sleep(1) # Tabiiy pauza
 
             answer = get_ai_answer(chat_id, user_content_for_ai)
             send_message(chat_id, answer, business_connection_id)
