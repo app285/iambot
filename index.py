@@ -1,227 +1,93 @@
 import os
-import time
-import sqlite3
 import requests
 from flask import Flask, request
 from groq import Groq
 
 app = Flask(__name__)
 
+# Tokenlar Vercel Environment Variables orqali olinadi (kod ichida yozilmaydi!)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
 groq_client = Groq(api_key=GROQ_API_KEY)
-
-# ==================== 3-BAND: SQLITE BAZA ORQALI XOTIRANI SAQLASH ====================
-def init_db():
-    """Foydalanuvchilar suhbat tarixini doimiy saqlash uchun baza ochish"""
-    conn = sqlite3.connect("chat_history.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            chat_id TEXT,
-            role TEXT,
-            content TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def get_chat_history(chat_id):
-    """Bazadan chat tarixini olish"""
-    conn = sqlite3.connect("chat_history.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT role, content FROM messages WHERE chat_id = ?", (str(chat_id),))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    history = []
-    for row in rows:
-        history.append({"role": row[0], "content": row[1]})
-    return history
-
-def save_message_to_db(chat_id, role, content):
-    """Bazaga yangi xabarni qo'shish va 10 tadan oshigini o'chirish"""
-    conn = sqlite3.connect("chat_history.db")
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)", (str(chat_id), role, content))
-    conn.commit()
-    
-    # Tarix juda uzun bo'lib ketmasligi uchun faqat oxirgi 12 ta xabarni saqlaymiz
-    cursor.execute("""
-        DELETE FROM messages WHERE rowid NOT IN (
-            SELECT rowid FROM messages WHERE chat_id = ? ORDER BY rowid DESC LIMIT 12
-        ) AND chat_id = ?
-    """, (str(chat_id), str(chat_id)))
-    conn.commit()
-    conn.close()
-# ====================================================================================
-
-
-def send_chat_action(chat_id, action="typing", business_connection_id=None):
-    """Chatda 'yozmoqda...' holatini ko'rsatish"""
-    try:
-        payload = {"chat_id": chat_id, "action": action}
-        if business_connection_id:
-            payload["business_connection_id"] = business_connection_id
-        requests.post(f"{TELEGRAM_API_URL}/sendChatAction", json=payload, timeout=5)
-    except Exception as e:
-        print("Chat action xatolik:", e)
 
 
 def send_message(chat_id, text, business_connection_id=None):
-    """Telegram'ga matnli xabar yuborish"""
+    """Telegram'ga xabar yuborish (oddiy yoki Business akkaunt nomidan)"""
     try:
         payload = {"chat_id": chat_id, "text": text}
         if business_connection_id:
             payload["business_connection_id"] = business_connection_id
-        requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=10)
+        requests.post(
+            f"{TELEGRAM_API_URL}/sendMessage",
+            json=payload,
+            timeout=10,
+        )
     except Exception as e:
         print("Telegramga yuborishda xatolik:", e)
 
 
-def download_telegram_file(file_id):
-    """Telegram serveridan fayl URL manzilini olish"""
-    try:
-        res = requests.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}", timeout=10)
-        file_path = res.json().get("result", {}).get("file_path")
-        if file_path:
-            return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-    except Exception as e:
-        print("Fayl yo'lini olishda xatolik:", e)
-    return None
+SYSTEM_PROMPT = """Sen Telegram akkaunt egasining shaxsiy yordamchisisan. Sizga yozgan odamlarga AKKAUNT EGASINING NOMIDAN, xuddi u odamning o'zi kabi javob berasan.
 
-
-# ==================== 4-BAND: AVTOMATLASHGAN REJIM VA HOLATLAR ====================
-def get_current_status_prompt():
-    """Vaqtga qarab eganing holatini aniqlash (Masalan, tun yoki dars vaqti)"""
-    import datetime
-    now = datetime.datetime.now()
-    hour = now.hour
-
-    # Kechasi (23:00 dan 07:00 gacha)
-    if hour >= 23 or hour < 7:
-        return "Hozir kekasi vaqt, akkaunt egasi uxlab yotibdi. Agar yozishsa, qisqa qilib 'uxlayapman, ertalab gaplashamiz' degan ma'noda tabiiy javob ber."
-    # Kunduzi o'qish/dars vaqti (masalan, 09:00 dan 14:00 gacha)
-    elif 9 <= hour <= 14:
-        return "Hozir kunduzgi o'qish/dars vaqti. Akkaunt egasi band bo'lishi mumkin, shuning uchun biroz qisqaroq va kechroq javob yozishini bildiradigan tarzda muloqot qil."
-    else:
-        return "Hozir bo'sh vaqti, odatdagidek samimiy va erkin muloqot qil."
-# ====================================================================================
-
-
-def get_ai_answer(chat_id, user_message_content):
-    """Groq AI orqali doimiy bazadagi tarix va holatni inobatga olib javob olish"""
-    try:
-        # Bazadan tarixni olamiz
-        history = get_chat_history(chat_id)
-        
-        # Yangi xabarni bazaga yozamiz
-        save_message_to_db(chat_id, "user", user_message_content)
-        history.append({"role": "user", "content": user_message_content})
-
-        # Dinamik holat promptini qo'shamiz
-        dynamic_status = get_current_status_prompt()
-
-        system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy yordamchisisan. Sizga yozgan odamlarga AKKAUNT EGASINING NOMIDAN, xuddi o'sha odamning o'zi kabi javob berasan.
-
-JORIY HOLAT QOIDASI:
-- {dynamic_status}
-
-ENG MUHIM QOIDA (HECH QACHON BUZMA):
-- Sen SUN'IY INTELLEKT, BOT, YORDAMCHI, DASTUR EKANINGNI HECH QACHON, HECH QANDAY SHAROITDA aytmaysan yoki bildirmaysan.
-- Agar kimdir "sen botmisan?", "sun'iy intellektmisan?", "kim yaratgan seni?" desa, ODDIY INSON sifatida tabiiy rad et (masalan: "yo'q, nima derding", "hazillashyapsanmi", "albatta odamman").
-- O'zingga ism qo'ymaysan.
-
-TIL VA ALIFBO QOIDASI:
-- Suhbatdosh qaysi tilda yozsa, aynan o'sha tilda javob ber.
-- Lotincha yozsa — lotincha, kirillcha yozsa — kirillcha javob qaytar.
+TIL QOIDASI:
+- Sizga yozgan odam qaysi tilda yozsa, aynan o'sha tilda javob ber.
+- Agar o'zbek tilida (lotin yoki krill) yozsa — o'zbek tilida, tabiiy va jonli uslubda javob ber, so'zma-so'z tarjima qilingandek emas.
+- Agar rus yoki ingliz tilida yozsa — o'sha tilda javob ber.
+- Til aralashtirma, faqat suhbatdosh o'zi aralashtirsa moslash mumkin.
 
 MULOQOT USLUBI:
-- Xuddi haqiqiy, samimiy inson yozayotgandek erkin va jonli gaplash (1-3 jumla).
-- Rasmiyatchilikdan qoch, ortiqcha kirish so'zlarsiz to'g'ridan-to'g'ri mavzuga o't."""
+- Xuddi haqiqiy, iliq munosabatli, samimiy inson yozayotgandek yoz. Sun'iy intellekt yoki bot ekaningni hech qachon aytma yoki bildirma.
+- Rasmiy, quruq yoki mexanik tarzda emas, jonli, samimiy, tabiiy tarzda gapir.
+- Javoblaring qisqa va lo'nda bo'lsin — Telegram xabar almashinuvi, uzun insho emas. Odatda 1-3 jumla yetarli.
+- Ortiqcha rasmiy so'zlar, keraksiz kirish gaplar ("Albatta, mana javob:" kabi) ishlatma — to'g'ridan-to'g'ri mohiyatga o't.
+- Agar savol noaniq yoki qisqa bo'lsa ("salom", "nima gap", "qalesan" kabi), aniqlashtiruvchi savol berib o'tirmasdan, eng tabiiy va mantiqiy tarzda javob ber — xuddi haqiqiy suhbatdosh kabi.
+- Suhbatdosh hazil qilsa — hazil bilan javob ber, jiddiy masala so'rasa — jiddiy va aniq javob ber. Kayfiyatga moslash.
+- Emoji ishlatishing mumkin, lekin me'yorida, har jumlada emas.
+- Agar savolga aniq javob berolmasang, taxmin qilib chalkashtirmasdan, tabiiy tarzda "hozir aniq ayta olmayman, keyinroq gaplashamiz" kabi ma'noda javob ber.
 
-        messages_payload = [{"role": "system", "content": system_prompt}] + history
+Shu qoidalarga doimo amal qil va har bir suhbatdosh bilan xuddi shaxsiy, jonli suhbatdoshdek muloqot qil."""
 
+
+def get_ai_answer(user_text):
+    """Groq AI orqali javob olish"""
+    try:
         chat_completion = groq_client.chat.completions.create(
-            messages=messages_payload,
-            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            model="llama-3.3-70b-versatile",  # llama3-70b-8192 eskirgan, joriy model
         )
-        
-        answer = chat_completion.choices[0].message.content
-
-        # Botning javobini ham bazaga saqlaymiz
-        save_message_to_db(chat_id, "assistant", answer)
-
-        return answer
+        return chat_completion.choices[0].message.content
     except Exception as e:
         print("Groq xatolik:", e)
-        return "Keyinroq yozvoraman, ozgina bandman."
+        return "Xatolik yuz berdi. Qayta urinib ko'ring."
 
 
 @app.route("/", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
-        return "Bot SQLite xotira va avtomat rejim bilan ishlayapti! ✅"
+        return "Bot ishlayapti! ✅"
 
     try:
         data = request.get_json(force=True)
 
-        if "business_message" in data:
-            message = data["business_message"]
-            business_connection_id = message.get("business_connection_id")
-        elif "message" in data:
-            message = data["message"]
-            business_connection_id = None
-        else:
+        # Oddiy bot xabari yoki Business (Chat Automation) xabari bo'lishi mumkin
+        message = data.get("message") or data.get("business_message")
+        business_connection_id = data.get("business_message", {}).get("business_connection_id") if data.get("business_message") else None
+
+        if not message:
             return "OK", 200
 
         chat_id = message["chat"]["id"]
-        text = message.get("text")
-        voice = message.get("voice")
+        text = message.get("text", "")
 
         if text == "/start":
-            send_message(chat_id, "Salom! Keyinroq yozaman, hozir ozgina band edim.", business_connection_id)
-            return "OK", 200
-
-        user_content_for_ai = None
-
-        # Ovozli xabarni matnga o'girish (Whisper)
-        if voice:
-            send_chat_action(chat_id, "typing", business_connection_id)
-            file_id = voice["file_id"]
-            file_url = download_telegram_file(file_id)
-            
-            if file_url:
-                try:
-                    audio_response = requests.get(file_url)
-                    audio_file_path = f"/tmp/{file_id}.ogg"
-                    with open(audio_file_path, "wb") as f:
-                        f.write(audio_response.content)
-
-                    with open(audio_file_path, "rb") as audio_file:
-                        transcription = groq_client.audio.transcriptions.create(
-                            file=(audio_file_path, audio_file.read()),
-                            model="whisper-large-v3",
-                            prompt="O'zbek tilidagi ovozli xabar",
-                        )
-                    user_content_for_ai = f"[Ovozli xabar matni]: {transcription.text}"
-                    os.remove(audio_file_path)
-                except Exception as e:
-                    print("Whisper xatolik:", e)
-                    user_content_for_ai = "[Ovozli xabar keldi]"
-
+            send_message(chat_id, "Assalomu alaykum! Men ishlayapman.", business_connection_id)
         elif text:
-            user_content_for_ai = text
-
-        if user_content_for_ai:
-            send_chat_action(chat_id, "typing", business_connection_id)
-            time.sleep(1) # Tabiiy pauza
-
-            answer = get_ai_answer(chat_id, user_content_for_ai)
+            answer = get_ai_answer(text)
             send_message(chat_id, answer, business_connection_id)
 
         return "OK", 200
@@ -231,5 +97,6 @@ def webhook():
         return "ERROR", 500
 
 
+# Lokal test uchun (Vercelda ishlatilmaydi)
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
