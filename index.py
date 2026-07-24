@@ -15,7 +15,18 @@ if not TELEGRAM_TOKEN or not GROQ_API_KEY:
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 groq_client = Groq(api_key=GROQ_API_KEY)
 
+# --- MODELLAR (yangilangan) ---
+# Eski "llama-3.3-70b-versatile" va "llama-3.2-11b-vision-preview" Groq tomonidan
+# bekor qilingan (deprecated) va endi ishlamaydi. O'rniga hozirgi tavsiya etilgan
+# modellar ishlatiladi. Agar kelajakda bular ham eskirsa, https://console.groq.com/docs/models
+# sahifasidan joriy ro'yxatni tekshiring.
+TEXT_MODEL = "openai/gpt-oss-120b"
+VISION_MODEL = "qwen/qwen3.6-27b"  # hozircha "preview" statusida - vaqti-vaqti bilan tekshirib turing
+
 # Vercel uchun vaqtinchalik xotira (Dictionary)
+# DIQQAT: Vercel kabi serverless muhitda bu dictionary'lar har doim ham saqlanib
+# qolavermaydi - har bir "cold start"da tozalanishi mumkin. Agar tarix doimiy
+# saqlanishi kerak bo'lsa, tashqi baza (Redis, Postgres va h.k.) ishlatish tavsiya etiladi.
 chat_histories = {}
 MAX_HISTORY_LENGTH = 10
 
@@ -80,15 +91,16 @@ def download_telegram_file(file_id):
 
 
 def get_ai_answer(chat_id, user_message_content):
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = []
+
+    # Xabarni tarixga qo'shamiz
+    chat_histories[chat_id].append({"role": "user", "content": user_message_content})
+
+    if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH:
+        chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY_LENGTH:]
+
     try:
-        if chat_id not in chat_histories:
-            chat_histories[chat_id] = []
-
-        chat_histories[chat_id].append({"role": "user", "content": user_message_content})
-
-        if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH:
-            chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY_LENGTH:]
-
         current_mood = chat_moods.get(chat_id, "normal")
         mood_instruction = ""
         if current_mood == "hazil":
@@ -124,7 +136,7 @@ MULOQOT USLUBI:
 
         chat_completion = groq_client.chat.completions.create(
             messages=messages_payload,
-            model="llama-3.3-70b-versatile",
+            model=TEXT_MODEL,
             timeout=REQUEST_TIMEOUT,
         )
 
@@ -136,6 +148,11 @@ MULOQOT USLUBI:
         import traceback
         traceback.print_exc()  # Terminalda xatolikni aniq ko'rsatadi
         print("Groq xatolik tafsiloti:", e)
+        # Xatolik bo'lsa, tarixga qo'shilgan "user" xabarini olib tashlaymiz,
+        # aks holda keyingi so'rovda "assistant"siz "user" xabari tarixda qoladi
+        # va konteksti buzilib ketadi.
+        if chat_histories.get(chat_id) and chat_histories[chat_id][-1]["role"] == "user":
+            chat_histories[chat_id].pop()
         return "Keyinroq yozvoraman."
 
 
@@ -163,6 +180,11 @@ def webhook():
             message = data["message"]
             business_connection_id = None
         else:
+            return "OK", 200
+
+        # "chat" har doim ham mavjud bo'lavermasligi mumkin bo'lgan update turlari
+        # uchun himoya - aks holda KeyError bilan 500 xato qaytardi.
+        if "chat" not in message:
             return "OK", 200
 
         sender_id = message.get("from", {}).get("id")
@@ -209,9 +231,8 @@ def webhook():
 
             if file_url:
                 try:
-                    # Vision uchun ham barqaror model ishlatamiz
                     vision_completion = groq_client.chat.completions.create(
-                        model="llama-3.2-11b-vision-preview",
+                        model=VISION_MODEL,
                         messages=[
                             {
                                 "role": "user",
@@ -229,6 +250,8 @@ def webhook():
                 except Exception as e:
                     print("Vision xatolik:", e)
                     user_content_for_ai = "[Menga rasm yubordi]"
+            else:
+                user_content_for_ai = "[Menga rasm yubordi]"
 
         elif voice:
             send_chat_action(chat_id, "typing", business_connection_id)
@@ -236,9 +259,9 @@ def webhook():
             file_url = download_telegram_file(file_id)
 
             if file_url:
+                audio_file_path = f"/tmp/{file_id}.ogg"
                 try:
                     audio_response = requests.get(file_url, timeout=REQUEST_TIMEOUT)
-                    audio_file_path = f"/tmp/{file_id}.ogg"
                     with open(audio_file_path, "wb") as f:
                         f.write(audio_response.content)
 
@@ -249,10 +272,16 @@ def webhook():
                             prompt="O'zbek tilidagi ovozli xabar",
                         )
                     user_content_for_ai = f"[Ovozli xabar matni]: {transcription.text}"
-                    os.remove(audio_file_path)
                 except Exception as e:
                     print("Whisper xatolik:", e)
                     user_content_for_ai = "[Ovozli xabar keldi]"
+                finally:
+                    # Fayl xatolik yuz berganda ham o'chirilishi kerak, aks holda
+                    # /tmp to'lib qolishi mumkin.
+                    if os.path.exists(audio_file_path):
+                        os.remove(audio_file_path)
+            else:
+                user_content_for_ai = "[Ovozli xabar keldi]"
 
         elif text:
             user_content_for_ai = text
