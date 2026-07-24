@@ -117,6 +117,7 @@ def webhook():
     try:
         data = request.get_json(force=True)
 
+        # Qaysi turdagi xabar ekanini aniqlaymiz
         if "business_message" in data:
             message = data["business_message"]
             business_connection_id = message.get("business_connection_id")
@@ -126,23 +127,13 @@ def webhook():
         else:
             return "OK", 200
 
-      if "business_message" in data:
-            message = data["business_message"]
-            business_connection_id = message.get("business_connection_id")
-        elif "message" in data:
-            message = data["message"]
-            business_connection_id = None
-        else:
-            return "OK", 200
-
-        # ==========================================
-        # MANA SHU YERGA QO'YASIZ (Eng birinchi bo'lib):
+        # ========================================================
+        # ENG MUHIM HIMOYA: 
+        # Agar xabarni O'ZINGIZ yozgan bo'lsangiz (is_self=True), 
+        # bot darhol to'xtaydi va hech qanday javob yozmaydi!
         if message.get("from", {}).get("is_self", False):
             return "OK", 200
-        # ==========================================
-
-        chat_id = message["chat"]["id"]
-        text = message.get("text")
+        # ========================================================
 
         chat_id = message["chat"]["id"]
         text = message.get("text")
