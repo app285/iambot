@@ -16,7 +16,7 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 chat_histories = {}
 MAX_HISTORY_LENGTH = 10
 
-# 4-band: Kayfiyat rejimlari uchun xotira (Har bir chat uchun alohida rejim)
+# Kayfiyat rejimlari uchun xotira
 chat_moods = {}
 
 
@@ -40,19 +40,6 @@ def send_message(chat_id, text, business_connection_id=None):
         print("Telegramga yuborishda xatolik:", e)
 
 
-# 2-band uchun: Ovozli xabar yuborish funksiyasi
-def send_voice_message(chat_id, audio_file_path, business_connection_id=None):
-    try:
-        with open(audio_file_path, "rb") as voice_file:
-            files = {"voice": voice_file}
-            data = {"chat_id": chat_id}
-            if business_connection_id:
-                data["business_connection_id"] = business_connection_id
-            requests.post(f"{TELEGRAM_API_URL}/sendVoice", data=data, files=files, timeout=15)
-    except Exception as e:
-        print("Ovozli xabar yuborishda xatolik:", e)
-
-
 def download_telegram_file(file_id):
     try:
         res = requests.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}", timeout=10)
@@ -74,7 +61,6 @@ def get_ai_answer(chat_id, user_message_content):
         if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH:
             chat_histories[chat_id] = chat_histories[chat_id][-MAX_HISTORY_LENGTH:]
 
-        # 4-band: Joriy kayfiyatni aniqlash
         current_mood = chat_moods.get(chat_id, "normal")
         mood_instruction = ""
         if current_mood == "hazil":
@@ -90,7 +76,7 @@ AKKAUNT EGASI HAQIDA MA'LUMOT (SEN SHU INSON SAN):
 - Agar kimdir ismingni, yoshingni yoki nima ish qilishingni so'rasa, yuqoridagi ma'lumotlarga tayanib xuddi o'zingdek oddiy va tabiiy javob ber.
 
 MUHIM QOIDA (O'QISH VA DARS HAQIDA TAQIQLANGAN):
-- Hech qachon "darsdaman", "o'qishdaman", "dars vaqti" yoki shunga o'xshash bandlik bahonalarini ishlatma. Faqat oddiy va samimiy muloqot qil.
+- Hech qachon "darsdaman", "o'qishdaman", "dars vaqti" yoki shunga o'xshash bandlik bahonalarini ishlatma. O'qish haqida umuman gapirma.
 {mood_instruction}
 
 TIL VA ALIFBO QOIDASI (QAT'IY BAJARILSIN):
@@ -140,20 +126,23 @@ def webhook():
         else:
             return "OK", 200
 
-        # O'zingiz yozgan xabarlarga aralashmaslik
+        # ========================================================
+        # ENG MUHIM HIMoya: Agar xabarni O'ZINGIZ yozgan bo'lsangiz, 
+        # bot darhol to'xtaydi va aslo aralashmaydi!
         if message.get("from", {}).get("is_self", False):
             return "OK", 200
+        # ========================================================
 
         chat_id = message["chat"]["id"]
         text = message.get("text")
         voice = message.get("voice")
-        photo = message.get("photo") # 1-band uchun rasm qismi
+        photo = message.get("photo")
 
         if text == "/start":
             send_message(chat_id, "Salom!", business_connection_id)
             return "OK", 200
 
-        # 4-band: Kayfiyatni o'zgartirish buyruqlari
+        # Kayfiyat buyruqlari
         if text == "/hazil":
             chat_moods[chat_id] = "hazil"
             send_message(chat_id, "Bo'ldi, endi hazillashib gaplashamiz! 😄", business_connection_id)
@@ -169,24 +158,22 @@ def webhook():
 
         user_content_for_ai = None
 
-        # 1-band: Rasmni o'qish (Vision)
+        # Rasm kelganda uni o'qish (Vision)
         if photo:
             send_chat_action(chat_id, "typing", business_connection_id)
-            # Rasmlar ro'yxatidan eng kattasini olamiz
             best_photo = photo[-1]
             file_id = best_photo["file_id"]
             file_url = download_telegram_file(file_id)
 
             if file_url:
                 try:
-                    # Groq orqali rasmni tahlil qilish uchun Llama-3.2-11B-Vision modelidan foydalanamiz
                     vision_completion = groq_client.chat.completions.create(
                         model="llama-3.2-11b-vision-preview",
                         messages=[
                             {
                                 "role": "user",
                                 "content": [
-                                    {"type": "text", "text": "Bu rasmda nima tasvirlangan? Qisqa qilib o'zbek tilida (lotin yoki kirillda, yozuvga qarab) o'zingning fikringni bildir."},
+                                    {"type": "text", "text": "Bu rasmda nima tasvirlangan? Qisqa qilib o'zbek tilida o'zingning fikringni bildir."},
                                     {"type": "image_url", "image_url": {"url": file_url}},
                                 ],
                             }
@@ -231,10 +218,6 @@ def webhook():
             time.sleep(1)
 
             answer = get_ai_answer(chat_id, user_content_for_ai)
-            
-            # 2-band uchun shart: Agar foydalanuvchi ULARGA OVOSLI XABAR yuborgan bo'lsa, 
-            # xohlasangiz ovozli javob qaytarish ham mumkin, lekin hozircha matn ko'rinishida 
-            # yuborish barqaror ishlashi uchun oddiy yuborish qoldirildi.
             send_message(chat_id, answer, business_connection_id)
 
         return "OK", 200
