@@ -148,6 +148,17 @@ def webhook():
     try:
         data = request.get_json(force=True)
 
+        # Telegram business ulanish o'rnatilganda/yangilanganda shu update keladi —
+        # bu yerdan akkaunt egasining user_id sini ishonchli tarzda, API chaqirmasdan olamiz.
+        if "business_connection" in data:
+            bc = data["business_connection"]
+            bc_id = bc.get("id")
+            owner_id = bc.get("user", {}).get("id")
+            if bc_id and owner_id:
+                business_owner_ids[bc_id] = owner_id
+                print(f"Business connection saqlandi: {bc_id} -> owner_id={owner_id}")
+            return "OK", 200
+
         if "business_message" in data:
             message = data["business_message"]
             business_connection_id = message.get("business_connection_id")
@@ -158,11 +169,20 @@ def webhook():
             return "OK", 200
 
         # HIMOYA: Xabar o'zingizdan chiqqan bo'lsa botni to'xtatish
-        is_outgoing = message.get("is_outgoing", False)
-        is_self = message.get("from", {}).get("is_self", False)
+        sender_id = message.get("from", {}).get("id")
 
-        if is_outgoing or is_self:
-            return "OK", 200
+        if business_connection_id:
+            owner_id = get_business_owner_id(business_connection_id)
+            print(f"DEBUG: business_connection_id={business_connection_id}, owner_id={owner_id}, sender_id={sender_id}")
+            if owner_id is None:
+                print("OGOHLANTIRISH: owner_id topilmadi — botni to'xtata olmayapmiz, owner o'zi yozsa ham javob beradi!")
+            if owner_id and sender_id == owner_id:
+                return "OK", 200
+        else:
+            is_outgoing = message.get("is_outgoing", False)
+            is_self = message.get("from", {}).get("is_self", False)
+            if is_outgoing or is_self:
+                return "OK", 200
 
         chat_id = message["chat"]["id"]
         text = message.get("text")
