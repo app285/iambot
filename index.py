@@ -227,6 +227,90 @@ def stop_typing_loop(thread, stop_event):
     thread.join(timeout=1)
 
 
+THINKING_EMOJIS = ["🌀", "🌗", "🌘", "🌑", "🌒", "🌓", "🌔"]
+
+
+def send_message_get_id(chat_id, text, business_connection_id=None):
+    """send_message'ga o'xshaydi, lekin xabar ID'sini qaytaradi (keyin edit/delete qilish uchun)."""
+    try:
+        payload = {"chat_id": chat_id, "text": text}
+        if business_connection_id:
+            payload["business_connection_id"] = business_connection_id
+        res = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=REQUEST_TIMEOUT)
+        return res.json().get("result", {}).get("message_id")
+    except Exception as e:
+        print("Thinking xabarini yuborishda xatolik:", e)
+        return None
+
+
+def delete_message(chat_id, message_id):
+    if not message_id:
+        return
+    try:
+        requests.post(
+            f"{TELEGRAM_API_URL}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=5,
+        )
+    except Exception as e:
+        print("Xabarni o'chirishda xatolik:", e)
+
+
+def keep_thinking_message(chat_id, message_id, stop_event, business_connection_id=None):
+    """
+    Mira botidagi kabi 'thinking' bubble'ni jonlantiradi:
+    har ~2 soniyada emoji va soniya hisoblagichini yangilaydi (masalan '🌗 O'ylayapman 4s').
+    """
+    elapsed = 0
+    frame = 0
+    while not stop_event.is_set():
+        stop_event.wait(2)
+        if stop_event.is_set():
+            break
+        elapsed += 2
+        frame = (frame + 1) % len(THINKING_EMOJIS)
+        emoji = THINKING_EMOJIS[frame]
+        try:
+            payload = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": f"{emoji} O'ylayapman... {elapsed}s",
+            }
+            if business_connection_id:
+                payload["business_connection_id"] = business_connection_id
+            requests.post(f"{TELEGRAM_API_URL}/editMessageText", json=payload, timeout=5)
+        except Exception as e:
+            print("Thinking xabarini yangilashda xatolik:", e)
+
+
+def start_thinking_bubble(chat_id, business_connection_id=None):
+    """
+    'O'ylayapman...' degan alohida xabar yuboradi (Mira botidagi 'Thinking' bubble kabi)
+    va uni fonda animatsiya qilib turadi. (message_id, thread, stop_event) qaytaradi.
+    Agar xabar yuborilmasa (message_id None), faqat native typing statusidan foydalaniladi.
+    """
+    message_id = send_message_get_id(chat_id, f"{THINKING_EMOJIS[0]} O'ylayapman...", business_connection_id)
+    stop_event = threading.Event()
+    if message_id is None:
+        return None, None, stop_event
+    thread = threading.Thread(
+        target=keep_thinking_message,
+        args=(chat_id, message_id, stop_event, business_connection_id),
+        daemon=True,
+    )
+    thread.start()
+    return message_id, thread, stop_event
+
+
+def stop_thinking_bubble(chat_id, message_id, thread, stop_event):
+    """Animatsiyani to'xtatadi va 'O'ylayapman...' xabarini o'chiradi (o'rniga asl javob yuboriladi)."""
+    stop_event.set()
+    if thread:
+        thread.join(timeout=1)
+    if message_id:
+        delete_message(chat_id, message_id)
+
+
 def _split_text(text, max_length):
     """Uzun matnni Telegram limitiga mos qismlarga bo'ladi, imkon qadar so'z chegarasida."""
     parts = []
@@ -630,8 +714,8 @@ def webhook():
         user_content_for_ai = None
 
         if photo:
-            # Rasm tahlili boshlanguncha ham "yozyapti..." animatsiyasini ishga tushiramiz
-            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
+            # Rasm tahlili boshlanguncha "O'ylayapman..." bubble'ni ishga tushiramiz
+            thinking_id, typing_thread, stop_typing_event = start_thinking_bubble(chat_id, business_connection_id)
             try:
                 best_photo = photo[-1]
                 file_id = best_photo["file_id"]
@@ -664,10 +748,10 @@ def webhook():
                 else:
                     user_content_for_ai = "[Menga rasm yubordi]"
             finally:
-                stop_typing_loop(typing_thread, stop_typing_event)
+                stop_thinking_bubble(chat_id, thinking_id, typing_thread, stop_typing_event)
 
         elif voice:
-            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
+            thinking_id, typing_thread, stop_typing_event = start_thinking_bubble(chat_id, business_connection_id)
             try:
                 file_id = voice["file_id"]
                 file_url = download_telegram_file(file_id)
@@ -698,7 +782,7 @@ def webhook():
                 else:
                     user_content_for_ai = "[Ovozli xabar keldi]"
             finally:
-                stop_typing_loop(typing_thread, stop_typing_event)
+                stop_thinking_bubble(chat_id, thinking_id, typing_thread, stop_typing_event)
 
         elif sticker:
             user_content_for_ai = "[Menga stiker yubordi]"
@@ -718,13 +802,13 @@ def webhook():
             # Admin monitoring: har bir xabar haqida sizga bildirishnoma
             notify_new_message(sender, chat_id, user_content_for_ai, business_connection_id)
 
-            # AI javob tayyorlanayotgan vaqt davomida "yozyapti..." animatsiyasi
-            # uzluksiz ko'rinishi uchun alohida thread'da ishga tushiramiz.
-            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
+            # Mira botidagi kabi "O'ylayapman..." bubble'ni chiqaramiz, AI javob
+            # tayyorlagach uni o'chirib, o'rniga haqiqiy javobni yuboramiz.
+            thinking_id, typing_thread, stop_typing_event = start_thinking_bubble(chat_id, business_connection_id)
             try:
                 answer = get_ai_answer(chat_id, user_content_for_ai, sender)
             finally:
-                stop_typing_loop(typing_thread, stop_typing_event)
+                stop_thinking_bubble(chat_id, thinking_id, typing_thread, stop_typing_event)
 
             send_message(chat_id, answer, business_connection_id)
 
