@@ -8,6 +8,7 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # sizning shaxsiy Telegram user_id'ingiz
 
 if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise RuntimeError("TELEGRAM_TOKEN yoki GROQ_API_KEY muhit o'zgaruvchisi topilmadi!")
@@ -16,17 +17,10 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # --- MODELLAR (yangilangan) ---
-# Eski "llama-3.3-70b-versatile" va "llama-3.2-11b-vision-preview" Groq tomonidan
-# bekor qilingan (deprecated) va endi ishlamaydi. O'rniga hozirgi tavsiya etilgan
-# modellar ishlatiladi. Agar kelajakda bular ham eskirsa, https://console.groq.com/docs/models
-# sahifasidan joriy ro'yxatni tekshiring.
 TEXT_MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "qwen/qwen3.6-27b"  # hozircha "preview" statusida - vaqti-vaqti bilan tekshirib turing
 
 # Vercel uchun vaqtinchalik xotira (Dictionary)
-# DIQQAT: Vercel kabi serverless muhitda bu dictionary'lar har doim ham saqlanib
-# qolavermaydi - har bir "cold start"da tozalanishi mumkin. Agar tarix doimiy
-# saqlanishi kerak bo'lsa, tashqi baza (Redis, Postgres va h.k.) ishlatish tavsiya etiladi.
 chat_histories = {}
 MAX_HISTORY_LENGTH = 10
 
@@ -36,8 +30,60 @@ chat_moods = {}
 # Business ulanishlar bo'yicha akkaunt egasining user_id sini keshlash
 business_owner_ids = {}
 
+# Oddiy rate-limit: chat_id -> oxirgi xabar vaqti
+last_message_time = {}
+MIN_SECONDS_BETWEEN_MESSAGES = 2
+
 REQUEST_TIMEOUT = 15
 
+
+# ---------------------------------------------------------------------------
+# ADMIN MONITORING
+# ---------------------------------------------------------------------------
+
+def notify_admin(text):
+    """Sizning shaxsiy Telegram akkauntingizga (ADMIN_CHAT_ID) xabar yuboradi."""
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"{TELEGRAM_API_URL}/sendMessage",
+            json={"chat_id": ADMIN_CHAT_ID, "text": text},
+            timeout=5,
+        )
+    except Exception as e:
+        print("Admin xabari yuborilmadi:", e)
+
+
+def format_sender_info(sender, chat_id, business_connection_id=None):
+    username = sender.get("username")
+    full_name = f"{sender.get('first_name', '')} {sender.get('last_name') or ''}".strip()
+    lines = [
+        f"👤 Kimdan: {full_name or '(ismsiz)'}",
+        f"🆔 User ID: {sender.get('id')}",
+        f"💬 Chat ID: {chat_id}",
+    ]
+    if username:
+        lines.append(f"🔗 Username: @{username}")
+    if business_connection_id:
+        lines.append("🏢 Manba: Business chat")
+    return "\n".join(lines)
+
+
+def notify_new_message(sender, chat_id, content_preview, business_connection_id=None):
+    info = format_sender_info(sender, chat_id, business_connection_id)
+    preview = (content_preview or "")[:300]
+    notify_admin(f"📩 Yangi xabar\n{info}\n\n✉️ Matn: {preview}")
+
+
+def notify_error(context, sender, chat_id, error):
+    info = format_sender_info(sender, chat_id) if sender else f"Chat ID: {chat_id}"
+    notify_admin(f"⚠️ Xatolik ({context})\n{info}\n\nXato: {error}")
+
+
+# ---------------------------------------------------------------------------
+# YORDAMCHI FUNKSIYALAR
+# ---------------------------------------------------------------------------
 
 def get_business_owner_id(business_connection_id):
     if business_connection_id in business_owner_ids:
@@ -56,6 +102,7 @@ def get_business_owner_id(business_connection_id):
         return owner_id
     except Exception as e:
         print("Business connection ma'lumotini olishda xatolik:", e)
+        notify_admin(f"⚠️ Business connection xatosi: {e}")
         return None
 
 
@@ -90,11 +137,19 @@ def download_telegram_file(file_id):
     return None
 
 
-def get_ai_answer(chat_id, user_message_content):
+def is_rate_limited(chat_id):
+    now = time.time()
+    last_time = last_message_time.get(chat_id)
+    last_message_time[chat_id] = now
+    if last_time is not None and (now - last_time) < MIN_SECONDS_BETWEEN_MESSAGES:
+        return True
+    return False
+
+
+def get_ai_answer(chat_id, user_message_content, sender=None):
     if chat_id not in chat_histories:
         chat_histories[chat_id] = []
 
-    # Xabarni tarixga qo'shamiz
     chat_histories[chat_id].append({"role": "user", "content": user_message_content})
 
     if len(chat_histories[chat_id]) > MAX_HISTORY_LENGTH:
@@ -146,11 +201,9 @@ MULOQOT USLUBI:
         return answer
     except Exception as e:
         import traceback
-        traceback.print_exc()  # Terminalda xatolikni aniq ko'rsatadi
+        traceback.print_exc()
         print("Groq xatolik tafsiloti:", e)
-        # Xatolik bo'lsa, tarixga qo'shilgan "user" xabarini olib tashlaymiz,
-        # aks holda keyingi so'rovda "assistant"siz "user" xabari tarixda qoladi
-        # va konteksti buzilib ketadi.
+        notify_error("Groq javob berishda", sender, chat_id, e)
         if chat_histories.get(chat_id) and chat_histories[chat_id][-1]["role"] == "user":
             chat_histories[chat_id].pop()
         return "Keyinroq yozvoraman."
@@ -182,12 +235,11 @@ def webhook():
         else:
             return "OK", 200
 
-        # "chat" har doim ham mavjud bo'lavermasligi mumkin bo'lgan update turlari
-        # uchun himoya - aks holda KeyError bilan 500 xato qaytardi.
         if "chat" not in message:
             return "OK", 200
 
-        sender_id = message.get("from", {}).get("id")
+        sender = message.get("from", {})
+        sender_id = sender.get("id")
 
         if business_connection_id:
             owner_id = get_business_owner_id(business_connection_id)
@@ -203,6 +255,10 @@ def webhook():
         text = message.get("text")
         voice = message.get("voice")
         photo = message.get("photo")
+
+        # Oddiy rate-limit: juda tez-tez yozilgan xabarlarni e'tiborsiz qoldiramiz
+        if is_rate_limited(chat_id):
+            return "OK", 200
 
         if text == "/start":
             send_message(chat_id, "Salom!", business_connection_id)
@@ -249,6 +305,7 @@ def webhook():
                     user_content_for_ai = f"[Menga rasm yubordi, rasm mazmuni]: {image_description}"
                 except Exception as e:
                     print("Vision xatolik:", e)
+                    notify_error("Rasm tahlilida (vision)", sender, chat_id, e)
                     user_content_for_ai = "[Menga rasm yubordi]"
             else:
                 user_content_for_ai = "[Menga rasm yubordi]"
@@ -274,10 +331,9 @@ def webhook():
                     user_content_for_ai = f"[Ovozli xabar matni]: {transcription.text}"
                 except Exception as e:
                     print("Whisper xatolik:", e)
+                    notify_error("Ovozli xabarni matnga o'tkazishda (whisper)", sender, chat_id, e)
                     user_content_for_ai = "[Ovozli xabar keldi]"
                 finally:
-                    # Fayl xatolik yuz berganda ham o'chirilishi kerak, aks holda
-                    # /tmp to'lib qolishi mumkin.
                     if os.path.exists(audio_file_path):
                         os.remove(audio_file_path)
             else:
@@ -287,16 +343,20 @@ def webhook():
             user_content_for_ai = text
 
         if user_content_for_ai:
+            # Admin monitoring: har bir xabar haqida sizga bildirishnoma
+            notify_new_message(sender, chat_id, user_content_for_ai, business_connection_id)
+
             send_chat_action(chat_id, "typing", business_connection_id)
             time.sleep(1)
 
-            answer = get_ai_answer(chat_id, user_content_for_ai)
+            answer = get_ai_answer(chat_id, user_content_for_ai, sender)
             send_message(chat_id, answer, business_connection_id)
 
         return "OK", 200
 
     except Exception as e:
         print("Xatolik:", e)
+        notify_admin(f"🔴 Umumiy xatolik (webhook):\n{e}")
         return "ERROR", 500
 
 
