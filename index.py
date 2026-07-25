@@ -1,5 +1,6 @@
 import os
 import time
+import datetime
 import requests
 from flask import Flask, request
 from groq import Groq
@@ -19,6 +20,9 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 # --- MODELLAR ---
 TEXT_MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "qwen/qwen3.6-27b"  # hozircha "preview" statusida - vaqti-vaqti bilan tekshirib turing
+
+# Bot shu nusxa qachon ishga tushganini bilish uchun (cold start'da qayta o'rnatiladi)
+BOT_START_TIME = time.time()
 
 # Vercel uchun vaqtinchalik xotira (Dictionary)
 chat_histories = {}
@@ -42,6 +46,26 @@ MIN_SECONDS_BETWEEN_MESSAGES = 2
 # takrorlab qayta ishlamaslik uchun (masalan tarmoq sekin javob qaytarganda).
 processed_update_ids = set()
 MAX_PROCESSED_IDS = 2000
+
+# --- XAVFSIZLIK ---
+# Bloklangan foydalanuvchilar (user_id to'plami)
+blocked_users = set()
+
+# Kunlik xabar limiti: chat_id -> {"date": "YYYY-MM-DD", "count": n}
+daily_usage = {}
+DAILY_MESSAGE_LIMIT = 60
+
+# --- STATISTIKA (joriy sessiya davomida, cold start'da nolga tushadi) ---
+stats = {
+    "total_messages": 0,
+    "total_errors": 0,
+}
+
+# --- XATOLIKLARNI KUZATISH ---
+# Ketma-ket xatolar sonini kuzatib, agar juda ko'p bo'lsa alohida ogohlantirish beramiz
+# (masalan Groq API kaliti tugagan yoki xizmat butunlay ishlamay qolgan bo'lishi mumkin)
+consecutive_groq_errors = {"count": 0}
+CONSECUTIVE_ERROR_ALERT_THRESHOLD = 3
 
 REQUEST_TIMEOUT = 15
 TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram cheklovi 4096, xavfsizlik uchun kichikroq
@@ -85,6 +109,12 @@ def notify_admin(text):
         print("Admin xabari yuborilmadi:", e)
 
 
+def is_admin(sender_id):
+    if not ADMIN_CHAT_ID or sender_id is None:
+        return False
+    return str(sender_id) == str(ADMIN_CHAT_ID)
+
+
 def format_sender_info(sender, chat_id, business_connection_id=None):
     username = sender.get("username")
     full_name = f"{sender.get('first_name', '')} {sender.get('last_name') or ''}".strip()
@@ -107,8 +137,23 @@ def notify_new_message(sender, chat_id, content_preview, business_connection_id=
 
 
 def notify_error(context, sender, chat_id, error):
+    stats["total_errors"] += 1
     info = format_sender_info(sender, chat_id) if sender else f"Chat ID: {chat_id}"
     notify_admin(f"⚠️ Xatolik ({context})\n{info}\n\nXato: {error}")
+
+
+def track_groq_result(success):
+    """Ketma-ket Groq xatolarini kuzatadi va muammo jiddiy bo'lsa maxsus ogohlantiradi."""
+    if success:
+        consecutive_groq_errors["count"] = 0
+        return
+    consecutive_groq_errors["count"] += 1
+    if consecutive_groq_errors["count"] == CONSECUTIVE_ERROR_ALERT_THRESHOLD:
+        notify_admin(
+            f"🔴 DIQQAT: Groq API ketma-ket {CONSECUTIVE_ERROR_ALERT_THRESHOLD} marta xato qaytardi!\n"
+            "Ehtimol API kaliti tugagan, limit oshgan yoki xizmat vaqtincha ishlamayapti. "
+            "https://console.groq.com dan tekshiring."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +276,17 @@ def is_duplicate_update(update_id):
     return False
 
 
+def is_daily_limit_exceeded(chat_id):
+    """Bitta chat kuniga DAILY_MESSAGE_LIMIT tadan ko'p xabar yubormasin."""
+    today = datetime.date.today().isoformat()
+    usage = daily_usage.get(chat_id)
+    if usage is None or usage["date"] != today:
+        daily_usage[chat_id] = {"date": today, "count": 1}
+        return False
+    usage["count"] += 1
+    return usage["count"] > DAILY_MESSAGE_LIMIT
+
+
 def build_language_keyboard():
     buttons = [
         [{"text": label, "callback_data": f"lang:{code}"}]
@@ -256,17 +312,44 @@ def get_help_text():
     )
 
 
+def format_uptime(seconds):
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} soat {minutes} daqiqa"
+    if minutes:
+        return f"{minutes} daqiqa {secs} soniya"
+    return f"{secs} soniya"
+
+
+def get_status_text():
+    uptime = format_uptime(time.time() - BOT_START_TIME)
+    return (
+        "🟢 Bot ishlamoqda\n\n"
+        f"⏱ Shu nusxa ishga tushganiga: {uptime}\n"
+        f"💬 Faol chatlar (joriy sessiyada): {len(chat_histories)}\n"
+        f"📨 Qayta ishlangan xabarlar (joriy sessiyada): {stats['total_messages']}\n"
+        f"⚠️ Xatoliklar (joriy sessiyada): {stats['total_errors']}\n"
+        f"🚫 Bloklangan foydalanuvchilar: {len(blocked_users)}\n\n"
+        "Eslatma: bu ko'rsatkichlar Vercel qayta ishga tushganda (cold start) nolga tushadi."
+    )
+
+
 def call_groq_with_retry(create_fn, retries=1):
     """Groq API chaqiruvini bajaradi, vaqtinchalik xatoda bir marta qayta urinadi."""
     last_exception = None
     for attempt in range(retries + 1):
         try:
-            return create_fn()
+            result = create_fn()
+            track_groq_result(success=True)
+            return result
         except Exception as e:
             last_exception = e
             if attempt < retries:
                 time.sleep(1.5)
                 continue
+    track_groq_result(success=False)
     raise last_exception
 
 
@@ -375,6 +458,7 @@ def handle_callback_query(callback_query):
 @app.route("/", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
+        # UptimeRobot yoki shunga o'xshash monitoring xizmati shu manzilni tekshirishi mumkin
         return "Bot mukammal ishlayapti! ✅"
 
     try:
@@ -415,6 +499,10 @@ def webhook():
         sender = message.get("from", {})
         sender_id = sender.get("id")
 
+        # --- XAVFSIZLIK: bloklangan foydalanuvchi ---
+        if sender_id in blocked_users:
+            return "OK", 200
+
         if business_connection_id:
             owner_id = get_business_owner_id(business_connection_id)
             if owner_id and sender_id == owner_id:
@@ -436,6 +524,30 @@ def webhook():
         # Oddiy rate-limit: juda tez-tez yozilgan xabarlarni e'tiborsiz qoldiramiz
         if is_rate_limited(chat_id):
             return "OK", 200
+
+        # --- ADMIN BUYRUQLARI ---
+        if text and text.startswith("/") and is_admin(sender_id):
+            if text == "/holat":
+                send_message(chat_id, get_status_text(), business_connection_id)
+                return "OK", 200
+
+            if text.startswith("/block"):
+                parts = text.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    blocked_users.add(int(parts[1]))
+                    send_message(chat_id, f"Foydalanuvchi {parts[1]} bloklandi 🚫", business_connection_id)
+                else:
+                    send_message(chat_id, "Foydalanish: /block <user_id>", business_connection_id)
+                return "OK", 200
+
+            if text.startswith("/unblock"):
+                parts = text.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    blocked_users.discard(int(parts[1]))
+                    send_message(chat_id, f"Foydalanuvchi {parts[1]} blokdan chiqarildi ✅", business_connection_id)
+                else:
+                    send_message(chat_id, "Foydalanish: /unblock <user_id>", business_connection_id)
+                return "OK", 200
 
         if text == "/start":
             send_message(chat_id, "Salom! /yordam yozsangiz nima qila olishimni ko'rasiz.", business_connection_id)
@@ -468,6 +580,15 @@ def webhook():
         elif text == "/normal":
             chat_moods[chat_id] = "normal"
             send_message(chat_id, "Odatdagi holatga qaytdik.", business_connection_id)
+            return "OK", 200
+
+        # --- XAVFSIZLIK: kunlik xabar limiti (admin uchun cheklanmagan) ---
+        if not is_admin(sender_id) and is_daily_limit_exceeded(chat_id):
+            send_message(
+                chat_id,
+                "Bugun uchun xabarlar limitiga yetdingiz 🙏 Ertaga davom etamiz.",
+                business_connection_id,
+            )
             return "OK", 200
 
         user_content_for_ai = None
@@ -549,6 +670,8 @@ def webhook():
             user_content_for_ai = text
 
         if user_content_for_ai:
+            stats["total_messages"] += 1
+
             # Admin monitoring: har bir xabar haqida sizga bildirishnoma
             notify_new_message(sender, chat_id, user_content_for_ai, business_connection_id)
 
