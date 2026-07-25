@@ -1,6 +1,7 @@
 import os
 import time
 import datetime
+import threading
 import requests
 from flask import Flask, request
 from groq import Groq
@@ -69,6 +70,11 @@ CONSECUTIVE_ERROR_ALERT_THRESHOLD = 3
 
 REQUEST_TIMEOUT = 15
 TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram cheklovi 4096, xavfsizlik uchun kichikroq
+
+# "Yozyapti..." animatsiyasi Telegram'da ~5 soniya davom etadi va o'zi o'chib qoladi.
+# Shuning uchun AI javob tayyorlayotgan vaqt davomida uni har necha soniyada
+# qayta yuborib turish kerak - shu holda animatsiya butun javob davomida ko'rinadi.
+TYPING_REFRESH_SECONDS = 4
 
 LANGUAGE_LABELS = {
     "auto": "🌐 Avto (yozgan tiliga qarab)",
@@ -189,6 +195,36 @@ def send_chat_action(chat_id, action="typing", business_connection_id=None):
         requests.post(f"{TELEGRAM_API_URL}/sendChatAction", json=payload, timeout=5)
     except Exception as e:
         print("Chat action xatolik:", e)
+
+
+def keep_typing(chat_id, stop_event, business_connection_id=None):
+    """
+    AI javob tayyorlayotgan vaqtda 'yozyapti...' statusini uzluksiz yuborib turadi.
+    Telegram'dagi typing animatsiyasi ~5 soniyada o'chib qoladi, shuning uchun
+    stop_event o'rnatilmaguncha har TYPING_REFRESH_SECONDS soniyada qayta yuboramiz.
+    Alohida thread'da ishga tushiriladi.
+    """
+    while not stop_event.is_set():
+        send_chat_action(chat_id, "typing", business_connection_id)
+        stop_event.wait(TYPING_REFRESH_SECONDS)
+
+
+def start_typing_loop(chat_id, business_connection_id=None):
+    """Typing animatsiyasini boshlaydi va (thread, stop_event) qaytaradi."""
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=keep_typing,
+        args=(chat_id, stop_event, business_connection_id),
+        daemon=True,
+    )
+    thread.start()
+    return thread, stop_event
+
+
+def stop_typing_loop(thread, stop_event):
+    """Typing animatsiyasini to'xtatadi va thread tugashini kutadi."""
+    stop_event.set()
+    thread.join(timeout=1)
 
 
 def _split_text(text, max_length):
@@ -594,68 +630,75 @@ def webhook():
         user_content_for_ai = None
 
         if photo:
-            send_chat_action(chat_id, "typing", business_connection_id)
-            best_photo = photo[-1]
-            file_id = best_photo["file_id"]
-            file_url = download_telegram_file(file_id)
+            # Rasm tahlili boshlanguncha ham "yozyapti..." animatsiyasini ishga tushiramiz
+            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
+            try:
+                best_photo = photo[-1]
+                file_id = best_photo["file_id"]
+                file_url = download_telegram_file(file_id)
 
-            if file_url:
-                try:
-                    vision_completion = call_groq_with_retry(
-                        lambda: groq_client.chat.completions.create(
-                            model=VISION_MODEL,
-                            messages=[
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": "Bu rasmda nima tasvirlangan? Qisqa qilib o'zbek tilida o'zingning fikringni bildir."},
-                                        {"type": "image_url", "image_url": {"url": file_url}},
-                                    ],
-                                }
-                            ],
-                            max_tokens=150,
-                            timeout=REQUEST_TIMEOUT,
-                        )
-                    )
-                    image_description = vision_completion.choices[0].message.content
-                    user_content_for_ai = f"[Menga rasm yubordi, rasm mazmuni]: {image_description}"
-                except Exception as e:
-                    print("Vision xatolik:", e)
-                    notify_error("Rasm tahlilida (vision)", sender, chat_id, e)
-                    user_content_for_ai = "[Menga rasm yubordi]"
-            else:
-                user_content_for_ai = "[Menga rasm yubordi]"
-
-        elif voice:
-            send_chat_action(chat_id, "typing", business_connection_id)
-            file_id = voice["file_id"]
-            file_url = download_telegram_file(file_id)
-
-            if file_url:
-                audio_file_path = f"/tmp/{file_id}.ogg"
-                try:
-                    audio_response = requests.get(file_url, timeout=REQUEST_TIMEOUT)
-                    with open(audio_file_path, "wb") as f:
-                        f.write(audio_response.content)
-
-                    with open(audio_file_path, "rb") as audio_file:
-                        transcription = call_groq_with_retry(
-                            lambda: groq_client.audio.transcriptions.create(
-                                file=(audio_file_path, audio_file.read()),
-                                model="whisper-large-v3",
-                                prompt="O'zbek tilidagi ovozli xabar",
+                if file_url:
+                    try:
+                        vision_completion = call_groq_with_retry(
+                            lambda: groq_client.chat.completions.create(
+                                model=VISION_MODEL,
+                                messages=[
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": "Bu rasmda nima tasvirlangan? Qisqa qilib o'zbek tilida o'zingning fikringni bildir."},
+                                            {"type": "image_url", "image_url": {"url": file_url}},
+                                        ],
+                                    }
+                                ],
+                                max_tokens=150,
+                                timeout=REQUEST_TIMEOUT,
                             )
                         )
-                    user_content_for_ai = f"[Ovozli xabar matni]: {transcription.text}"
-                except Exception as e:
-                    print("Whisper xatolik:", e)
-                    notify_error("Ovozli xabarni matnga o'tkazishda (whisper)", sender, chat_id, e)
+                        image_description = vision_completion.choices[0].message.content
+                        user_content_for_ai = f"[Menga rasm yubordi, rasm mazmuni]: {image_description}"
+                    except Exception as e:
+                        print("Vision xatolik:", e)
+                        notify_error("Rasm tahlilida (vision)", sender, chat_id, e)
+                        user_content_for_ai = "[Menga rasm yubordi]"
+                else:
+                    user_content_for_ai = "[Menga rasm yubordi]"
+            finally:
+                stop_typing_loop(typing_thread, stop_typing_event)
+
+        elif voice:
+            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
+            try:
+                file_id = voice["file_id"]
+                file_url = download_telegram_file(file_id)
+
+                if file_url:
+                    audio_file_path = f"/tmp/{file_id}.ogg"
+                    try:
+                        audio_response = requests.get(file_url, timeout=REQUEST_TIMEOUT)
+                        with open(audio_file_path, "wb") as f:
+                            f.write(audio_response.content)
+
+                        with open(audio_file_path, "rb") as audio_file:
+                            transcription = call_groq_with_retry(
+                                lambda: groq_client.audio.transcriptions.create(
+                                    file=(audio_file_path, audio_file.read()),
+                                    model="whisper-large-v3",
+                                    prompt="O'zbek tilidagi ovozli xabar",
+                                )
+                            )
+                        user_content_for_ai = f"[Ovozli xabar matni]: {transcription.text}"
+                    except Exception as e:
+                        print("Whisper xatolik:", e)
+                        notify_error("Ovozli xabarni matnga o'tkazishda (whisper)", sender, chat_id, e)
+                        user_content_for_ai = "[Ovozli xabar keldi]"
+                    finally:
+                        if os.path.exists(audio_file_path):
+                            os.remove(audio_file_path)
+                else:
                     user_content_for_ai = "[Ovozli xabar keldi]"
-                finally:
-                    if os.path.exists(audio_file_path):
-                        os.remove(audio_file_path)
-            else:
-                user_content_for_ai = "[Ovozli xabar keldi]"
+            finally:
+                stop_typing_loop(typing_thread, stop_typing_event)
 
         elif sticker:
             user_content_for_ai = "[Menga stiker yubordi]"
@@ -675,10 +718,14 @@ def webhook():
             # Admin monitoring: har bir xabar haqida sizga bildirishnoma
             notify_new_message(sender, chat_id, user_content_for_ai, business_connection_id)
 
-            send_chat_action(chat_id, "typing", business_connection_id)
-            time.sleep(1)
+            # AI javob tayyorlanayotgan vaqt davomida "yozyapti..." animatsiyasi
+            # uzluksiz ko'rinishi uchun alohida thread'da ishga tushiramiz.
+            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
+            try:
+                answer = get_ai_answer(chat_id, user_content_for_ai, sender)
+            finally:
+                stop_typing_loop(typing_thread, stop_typing_event)
 
-            answer = get_ai_answer(chat_id, user_content_for_ai, sender)
             send_message(chat_id, answer, business_connection_id)
 
         return "OK", 200
