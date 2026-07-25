@@ -16,7 +16,7 @@ if not TELEGRAM_TOKEN or not GROQ_API_KEY:
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# --- MODELLAR (yangilangan) ---
+# --- MODELLAR ---
 TEXT_MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "qwen/qwen3.6-27b"  # hozircha "preview" statusida - vaqti-vaqti bilan tekshirib turing
 
@@ -27,6 +27,10 @@ MAX_HISTORY_LENGTH = 10
 # Kayfiyat rejimlari uchun xotira
 chat_moods = {}
 
+# Majburiy til rejimi: chat_id -> "auto" | "en" | "uz_latin" | "uz_cyrillic" | "ru"
+chat_languages = {}
+DEFAULT_LANGUAGE = "auto"
+
 # Business ulanishlar bo'yicha akkaunt egasining user_id sini keshlash
 business_owner_ids = {}
 
@@ -34,7 +38,33 @@ business_owner_ids = {}
 last_message_time = {}
 MIN_SECONDS_BETWEEN_MESSAGES = 2
 
+# Telegram webhook'ni bir necha marta yuborishi mumkin bo'lgan update'larni
+# takrorlab qayta ishlamaslik uchun (masalan tarmoq sekin javob qaytarganda).
+processed_update_ids = set()
+MAX_PROCESSED_IDS = 2000
+
 REQUEST_TIMEOUT = 15
+TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram cheklovi 4096, xavfsizlik uchun kichikroq
+
+LANGUAGE_LABELS = {
+    "auto": "🌐 Avto (yozgan tiliga qarab)",
+    "en": "🇬🇧 Ingliz",
+    "uz_latin": "🇺🇿 O'zbek (lotin)",
+    "uz_cyrillic": "🇺🇿 Ўзбек (кирилл)",
+    "ru": "🇷🇺 Rus",
+}
+
+LANGUAGE_INSTRUCTIONS = {
+    "auto": (
+        "Suhbatdosh qaysi tilda yozsa, javobni FAQAT o'sha tilda ber (o'zbek, ingliz, rus va h.k.). "
+        "Tillarni aralashtirma. Agar suhbatdosh o'zbek tilida lotin alifbosida yozsa - sen ham lotincha yoz. "
+        "Agar suhbatdosh o'zbek tilida kirill alifbosida yozsa - sen ham kirillcha alifboda javob qaytar."
+    ),
+    "en": "Har doim FAQAT ingliz tilida javob ber, suhbatdosh qaysi tilda yozishidan qat'iy nazar.",
+    "uz_latin": "Har doim FAQAT o'zbek tilida, lotin alifbosida javob ber, suhbatdosh qaysi tilda yozishidan qat'iy nazar.",
+    "uz_cyrillic": "Har doim FAQAT ўзбек тилида, кирилл алифбосида жавоб бер, суҳбатдош қайси тилда ёзишидан қатъий назар.",
+    "ru": "Har doim FAQAT rus tilida javob ber, suhbatdosh qaysi tilda yozishidan qat'iy nazar.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -116,14 +146,56 @@ def send_chat_action(chat_id, action="typing", business_connection_id=None):
         print("Chat action xatolik:", e)
 
 
-def send_message(chat_id, text, business_connection_id=None):
+def _split_text(text, max_length):
+    """Uzun matnni Telegram limitiga mos qismlarga bo'ladi, imkon qadar so'z chegarasida."""
+    parts = []
+    remaining = text
+    while len(remaining) > max_length:
+        split_at = remaining.rfind("\n", 0, max_length)
+        if split_at == -1:
+            split_at = remaining.rfind(" ", 0, max_length)
+        if split_at == -1:
+            split_at = max_length
+        parts.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+def send_message(chat_id, text, business_connection_id=None, reply_markup=None):
+    if not text:
+        return
+    chunks = _split_text(text, TELEGRAM_MAX_MESSAGE_LENGTH)
+    for i, chunk in enumerate(chunks):
+        try:
+            payload = {"chat_id": chat_id, "text": chunk}
+            if business_connection_id:
+                payload["business_connection_id"] = business_connection_id
+            # Tugmalarni faqat oxirgi qismga qo'shamiz
+            if reply_markup and i == len(chunks) - 1:
+                payload["reply_markup"] = reply_markup
+            requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            print("Telegramga yuborishda xatolik:", e)
+
+
+def answer_callback_query(callback_query_id, text=None):
     try:
-        payload = {"chat_id": chat_id, "text": text}
-        if business_connection_id:
-            payload["business_connection_id"] = business_connection_id
-        requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=REQUEST_TIMEOUT)
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        requests.post(f"{TELEGRAM_API_URL}/answerCallbackQuery", json=payload, timeout=5)
     except Exception as e:
-        print("Telegramga yuborishda xatolik:", e)
+        print("Callback javobida xatolik:", e)
+
+
+def edit_message_text(chat_id, message_id, text):
+    try:
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        requests.post(f"{TELEGRAM_API_URL}/editMessageText", json=payload, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        print("Xabarni tahrirlashda xatolik:", e)
 
 
 def download_telegram_file(file_id):
@@ -146,6 +218,58 @@ def is_rate_limited(chat_id):
     return False
 
 
+def is_duplicate_update(update_id):
+    """Telegram bir xil update'ni ikki marta yuborishi mumkin - buni oldini oladi."""
+    if update_id is None:
+        return False
+    if update_id in processed_update_ids:
+        return True
+    processed_update_ids.add(update_id)
+    # Xotira cheksiz o'smasligi uchun ro'yxatni cheklab turamiz
+    if len(processed_update_ids) > MAX_PROCESSED_IDS:
+        processed_update_ids.clear()
+    return False
+
+
+def build_language_keyboard():
+    buttons = [
+        [{"text": label, "callback_data": f"lang:{code}"}]
+        for code, label in LANGUAGE_LABELS.items()
+    ]
+    return {"inline_keyboard": buttons}
+
+
+def get_help_text():
+    return (
+        "Salom! Men Shaxbozning AI-yordamchisiman 🤖\n\n"
+        "Nima qila olaman:\n"
+        "📝 Matnli xabarlarga javob beraman\n"
+        "🎤 Ovozli xabarlarni tinglab, tushunib javob beraman\n"
+        "🖼️ Yuborgan rasmingizni tahlil qilib bera olaman\n\n"
+        "Buyruqlar:\n"
+        "/hazil — hazilkash rejimga o'tish\n"
+        "/jiddiy — jiddiy rejimga o'tish\n"
+        "/normal — odatdagi rejimga qaytish\n"
+        "/til — javob tilini tanlash (ingliz, o'zbek, rus...)\n"
+        "/reset — suhbat tarixini tozalash\n"
+        "/yordam — shu xabarni ko'rsatish"
+    )
+
+
+def call_groq_with_retry(create_fn, retries=1):
+    """Groq API chaqiruvini bajaradi, vaqtinchalik xatoda bir marta qayta urinadi."""
+    last_exception = None
+    for attempt in range(retries + 1):
+        try:
+            return create_fn()
+        except Exception as e:
+            last_exception = e
+            if attempt < retries:
+                time.sleep(1.5)
+                continue
+    raise last_exception
+
+
 def get_ai_answer(chat_id, user_message_content, sender=None):
     if chat_id not in chat_histories:
         chat_histories[chat_id] = []
@@ -162,6 +286,9 @@ def get_ai_answer(chat_id, user_message_content, sender=None):
             mood_instruction = "\n- KAYFIYAT REJIMI: Hazilkash va qiziqqon tarzda gaplash."
         elif current_mood == "jiddiy":
             mood_instruction = "\n- KAYFIYAT REJIMI: Juda jiddiy va qisqa javob ber."
+
+        language_mode = chat_languages.get(chat_id, DEFAULT_LANGUAGE)
+        language_instruction = LANGUAGE_INSTRUCTIONS.get(language_mode, LANGUAGE_INSTRUCTIONS["auto"])
 
         system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy AI-yordamchisisan. Akkaunt egasi hozir band bo'lgani uchun, unga yozganlarga SEN javob berasan — lekin buni ochiq aytmasdan, xuddi tabiiy suhbatdoshdek erkin gaplashasan.
 
@@ -183,16 +310,16 @@ MULOQOT USLUBI:
 - Agar suhbatdosh oddiy va tinch gaplashsa — sen ham tinch va oddiy gaplash.
 
 🔴 TIL VA ALIFBO QOIDASI:
-- Suhbatdosh qaysi tilda yozsa, javobni FAQAT o'sha tilda ber (o'zbek, ingliz, rus va h.k.). Tillarni aralashtirma.
-- Agar suhbatdosh o'zbek tilida **lotin** alifbosida yozsa — sen ham lotincha yoz.
-- Agar suhbatdosh o'zbek tilida **kirill** alifbosida yozsa — sen ham kirillcha alifboda javob qaytar."""
+{language_instruction}"""
 
         messages_payload = [{"role": "system", "content": system_prompt}] + chat_histories[chat_id]
 
-        chat_completion = groq_client.chat.completions.create(
-            messages=messages_payload,
-            model=TEXT_MODEL,
-            timeout=REQUEST_TIMEOUT,
+        chat_completion = call_groq_with_retry(
+            lambda: groq_client.chat.completions.create(
+                messages=messages_payload,
+                model=TEXT_MODEL,
+                timeout=REQUEST_TIMEOUT,
+            )
         )
 
         answer = chat_completion.choices[0].message.content
@@ -209,6 +336,42 @@ MULOQOT USLUBI:
         return "Keyinroq yozvoraman."
 
 
+# ---------------------------------------------------------------------------
+# CALLBACK QUERY (TUGMALAR)
+# ---------------------------------------------------------------------------
+
+def handle_callback_query(callback_query):
+    callback_id = callback_query.get("id")
+    chat = callback_query.get("message", {}).get("chat", {})
+    chat_id = chat.get("id")
+    message_id = callback_query.get("message", {}).get("message_id")
+    data = callback_query.get("data", "")
+
+    if not chat_id:
+        answer_callback_query(callback_id)
+        return
+
+    if data.startswith("lang:"):
+        lang_code = data.split(":", 1)[1]
+        if lang_code in LANGUAGE_LABELS:
+            chat_languages[chat_id] = lang_code
+            answer_callback_query(callback_id, "Til o'zgartirildi ✅")
+            if message_id:
+                edit_message_text(
+                    chat_id, message_id,
+                    f"Til tanlandi: {LANGUAGE_LABELS[lang_code]}"
+                )
+        else:
+            answer_callback_query(callback_id)
+        return
+
+    answer_callback_query(callback_id)
+
+
+# ---------------------------------------------------------------------------
+# WEBHOOK
+# ---------------------------------------------------------------------------
+
 @app.route("/", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
@@ -216,6 +379,16 @@ def webhook():
 
     try:
         data = request.get_json(force=True)
+
+        # Telegram vaqti-vaqti bilan bitta update'ni qayta yuborishi mumkin -
+        # buni oldini olib, xabarga ikki marta javob bermaslikni ta'minlaymiz.
+        update_id = data.get("update_id")
+        if is_duplicate_update(update_id):
+            return "OK", 200
+
+        if "callback_query" in data:
+            handle_callback_query(data["callback_query"])
+            return "OK", 200
 
         if "business_connection" in data:
             bc = data["business_connection"]
@@ -233,6 +406,7 @@ def webhook():
             message = data["message"]
             business_connection_id = None
         else:
+            # edited_message, channel_post va boshqa turlarni e'tiborsiz qoldiramiz
             return "OK", 200
 
         if "chat" not in message:
@@ -255,13 +429,32 @@ def webhook():
         text = message.get("text")
         voice = message.get("voice")
         photo = message.get("photo")
+        sticker = message.get("sticker")
+        document = message.get("document")
+        video = message.get("video")
 
         # Oddiy rate-limit: juda tez-tez yozilgan xabarlarni e'tiborsiz qoldiramiz
         if is_rate_limited(chat_id):
             return "OK", 200
 
         if text == "/start":
-            send_message(chat_id, "Salom!", business_connection_id)
+            send_message(chat_id, "Salom! /yordam yozsangiz nima qila olishimni ko'rasiz.", business_connection_id)
+            return "OK", 200
+
+        if text in ("/yordam", "/help"):
+            send_message(chat_id, get_help_text(), business_connection_id)
+            return "OK", 200
+
+        if text == "/til":
+            send_message(
+                chat_id, "Qaysi tilda javob berishimni xohlaysiz?",
+                business_connection_id, reply_markup=build_language_keyboard()
+            )
+            return "OK", 200
+
+        if text == "/reset":
+            chat_histories.pop(chat_id, None)
+            send_message(chat_id, "Suhbat tarixi tozalandi 🧹", business_connection_id)
             return "OK", 200
 
         if text == "/hazil":
@@ -287,19 +480,21 @@ def webhook():
 
             if file_url:
                 try:
-                    vision_completion = groq_client.chat.completions.create(
-                        model=VISION_MODEL,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": "Bu rasmda nima tasvirlangan? Qisqa qilib o'zbek tilida o'zingning fikringni bildir."},
-                                    {"type": "image_url", "image_url": {"url": file_url}},
-                                ],
-                            }
-                        ],
-                        max_tokens=150,
-                        timeout=REQUEST_TIMEOUT,
+                    vision_completion = call_groq_with_retry(
+                        lambda: groq_client.chat.completions.create(
+                            model=VISION_MODEL,
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": "Bu rasmda nima tasvirlangan? Qisqa qilib o'zbek tilida o'zingning fikringni bildir."},
+                                        {"type": "image_url", "image_url": {"url": file_url}},
+                                    ],
+                                }
+                            ],
+                            max_tokens=150,
+                            timeout=REQUEST_TIMEOUT,
+                        )
                     )
                     image_description = vision_completion.choices[0].message.content
                     user_content_for_ai = f"[Menga rasm yubordi, rasm mazmuni]: {image_description}"
@@ -323,10 +518,12 @@ def webhook():
                         f.write(audio_response.content)
 
                     with open(audio_file_path, "rb") as audio_file:
-                        transcription = groq_client.audio.transcriptions.create(
-                            file=(audio_file_path, audio_file.read()),
-                            model="whisper-large-v3",
-                            prompt="O'zbek tilidagi ovozli xabar",
+                        transcription = call_groq_with_retry(
+                            lambda: groq_client.audio.transcriptions.create(
+                                file=(audio_file_path, audio_file.read()),
+                                model="whisper-large-v3",
+                                prompt="O'zbek tilidagi ovozli xabar",
+                            )
                         )
                     user_content_for_ai = f"[Ovozli xabar matni]: {transcription.text}"
                 except Exception as e:
@@ -338,6 +535,15 @@ def webhook():
                         os.remove(audio_file_path)
             else:
                 user_content_for_ai = "[Ovozli xabar keldi]"
+
+        elif sticker:
+            user_content_for_ai = "[Menga stiker yubordi]"
+
+        elif document:
+            user_content_for_ai = f"[Menga fayl yubordi: {document.get('file_name', 'nomsiz fayl')}]"
+
+        elif video:
+            user_content_for_ai = "[Menga video yubordi]"
 
         elif text:
             user_content_for_ai = text
