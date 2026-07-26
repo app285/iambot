@@ -36,6 +36,14 @@ chat_moods = {}
 chat_languages = {}
 DEFAULT_LANGUAGE = "auto"
 
+# Botga to'g'ridan-to'g'ri yozgan har bir foydalanuvchining ismi (shaxsiy
+# murojaat qilish uchun): chat_id -> ism. Business chat'larga (odam sizning
+# shaxsiy akkountingizga yozganda) bu tegishli emas - u yerda bot sizning
+# nomingizdan gapiradi, o'zi alohida "foydalanuvchi" emas.
+user_names = {}
+# Ismi hali so'ralgan, lekin javob kelmagan chat_id'lar to'plami.
+awaiting_name_chats = set()
+
 # Business ulanishlar bo'yicha akkaunt egasining user_id sini keshlash
 business_owner_ids = {}
 
@@ -389,7 +397,7 @@ def call_groq_with_retry(create_fn, retries=1):
     raise last_exception
 
 
-def get_ai_answer(chat_id, user_message_content, sender=None):
+def get_ai_answer(chat_id, user_message_content, sender=None, user_name=None):
     if chat_id not in chat_histories:
         chat_histories[chat_id] = []
 
@@ -422,10 +430,18 @@ def get_ai_answer(chat_id, user_message_content, sender=None):
                 "- Agar kimdir ismini so'rasa, ism o'ylab topma - shunchaki hozircha bilmasligingni tabiiy tarzda ayt."
             )
 
+        if user_name:
+            visitor_info = f"- Suhbatdoshning ismi: {user_name}. Vaqti-vaqti bilan (har xabarda emas) ismi bilan murojaat qil, bu suhbatni samimiyroq qiladi."
+        else:
+            visitor_info = "- Suhbatdoshning ismi hali noma'lum."
+
         system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy AI-yordamchisisan. Akkaunt egasi hozir band bo'lgani uchun, unga yozganlarga SEN javob berasan — lekin buni ochiq aytmasdan, xuddi tabiiy suhbatdoshdek erkin gaplashasan.
 
 AKKAUNT EGASI HAQIDA MA'LUMOT:
 {owner_info}
+
+SUHBATDOSH HAQIDA MA'LUMOT:
+{visitor_info}
 
 MUHIM QOIDA — HALOLLIK:
 - Agar kimdir to'g'ridan-to'g'ri "sen botmisan?", "sun'iy intellektmisan?", "AI mi?" deb so'rasa — buni yashirma, halol tan ol. Masalan: "ha, men {owner_name or 'egamning'} AI-yordamchisiman, u hozir javob berolmayapti" kabi qisqa va tabiiy tarzda ayt. Hech qachon "yo'q, odamman" deb yolg'on gapirma.
@@ -568,6 +584,30 @@ def webhook():
         if is_rate_limited(chat_id):
             return "OK", 200
 
+        # --- YANGI FOYDALANUVCHIDAN ISMINI SO'RASH ---
+        # Botga to'g'ridan-to'g'ri (business chat emas) birinchi marta yozgan va
+        # admin bo'lmagan har bir kishidan avval ismini so'raymiz, shunda AI uni
+        # keyinchalik ismi bilan chaqira oladi. Business chat'da bu qo'llanmaydi,
+        # chunki u yerda bot sizning shaxsingiz nomidan gaplashadi.
+        if not business_connection_id and not is_admin(sender_id) and chat_id not in user_names:
+            if chat_id in awaiting_name_chats:
+                if text and not text.startswith("/"):
+                    new_name = text.strip()[:50]
+                    user_names[chat_id] = new_name
+                    awaiting_name_chats.discard(chat_id)
+                    send_message(chat_id, f"Xursandman, {new_name}! Endi savolingizni yozavering 🙂")
+                else:
+                    send_message(chat_id, "Iltimos, avval ismingizni matn ko'rinishida yozib yuboring 🙂")
+                return "OK", 200
+            else:
+                awaiting_name_chats.add(chat_id)
+                send_message(
+                    chat_id,
+                    "Salom! 👋 Suhbatni boshlashdan oldin ismingizni bilsam yaxshi bo'lardi — "
+                    "shunda keyinchalik sizga ism bilan murojaat qilaman.\n\nIltimos, ismingizni yozing:",
+                )
+                return "OK", 200
+
         # --- ADMIN BUYRUQLARI ---
         if text and text.startswith("/") and is_admin(sender_id):
             if text == "/holat":
@@ -607,48 +647,57 @@ def webhook():
                     send_message(chat_id, "Foydalanish: /unblock <user_id>", business_connection_id)
                 return "OK", 200
 
-        if text == "/start":
-            if is_admin(sender_id) and not owner_name_state["name"]:
+        # MUHIM: bu buyruqlar (/start, /yordam, /til, /reset, /hazil...) FAQAT
+        # botning o'z chatida (business_connection_id yo'q holatda) ishlaydi.
+        # Agar kimdir sizning shaxsiy akkauntingizga (Business chat automation
+        # orqali) yozayotgan bo'lsa - business_connection_id mavjud bo'ladi va
+        # bu buyruqlar ATAYLAB o'tkazib yuboriladi, chunki aks holda tasodifan
+        # "/reset" yoki "/yordam" deb yozib qo'ygan odam sizning o'rningizga
+        # AI javob berayotganini payqab qolishi mumkin. Bunday holatda matn
+        # oddiy xabar sifatida to'g'ridan-to'g'ri AI'ga (pastga) boradi.
+        if not business_connection_id:
+            if text == "/start":
+                if is_admin(sender_id) and not owner_name_state["name"]:
+                    send_message(
+                        chat_id,
+                        "Salom! Botni ishga tushirishdan oldin ismingizni kiriting, chunki bot "
+                        "sizga yozganlarga javob berganda o'zini tanishtirishda shu ismdan foydalanadi "
+                        "(masalan: \"men Jasurning AI-yordamchisiman\").\n\n"
+                        "Yozing: /ismim <ismingiz>\nMasalan: /ismim Jasur",
+                        business_connection_id,
+                    )
+                    return "OK", 200
+                send_message(chat_id, "Salom! /yordam yozsangiz nima qila olishimni ko'rasiz.", business_connection_id)
+                return "OK", 200
+
+            if text in ("/yordam", "/help"):
+                send_message(chat_id, get_help_text(), business_connection_id)
+                return "OK", 200
+
+            if text == "/til":
                 send_message(
-                    chat_id,
-                    "Salom! Botni ishga tushirishdan oldin ismingizni kiriting, chunki bot "
-                    "sizga yozganlarga javob berganda o'zini tanishtirishda shu ismdan foydalanadi "
-                    "(masalan: \"men Jasurning AI-yordamchisiman\").\n\n"
-                    "Yozing: /ismim <ismingiz>\nMasalan: /ismim Jasur",
-                    business_connection_id,
+                    chat_id, "Qaysi tilda javob berishimni xohlaysiz?",
+                    business_connection_id, reply_markup=build_language_keyboard()
                 )
                 return "OK", 200
-            send_message(chat_id, "Salom! /yordam yozsangiz nima qila olishimni ko'rasiz.", business_connection_id)
-            return "OK", 200
 
-        if text in ("/yordam", "/help"):
-            send_message(chat_id, get_help_text(), business_connection_id)
-            return "OK", 200
+            if text == "/reset":
+                chat_histories.pop(chat_id, None)
+                send_message(chat_id, "Suhbat tarixi tozalandi 🧹", business_connection_id)
+                return "OK", 200
 
-        if text == "/til":
-            send_message(
-                chat_id, "Qaysi tilda javob berishimni xohlaysiz?",
-                business_connection_id, reply_markup=build_language_keyboard()
-            )
-            return "OK", 200
-
-        if text == "/reset":
-            chat_histories.pop(chat_id, None)
-            send_message(chat_id, "Suhbat tarixi tozalandi 🧹", business_connection_id)
-            return "OK", 200
-
-        if text == "/hazil":
-            chat_moods[chat_id] = "hazil"
-            send_message(chat_id, "Bo'ldi, endi hazillashib gaplashamiz! 😄", business_connection_id)
-            return "OK", 200
-        elif text == "/jiddiy":
-            chat_moods[chat_id] = "jiddiy"
-            send_message(chat_id, "Tushunarli, jiddiy rejimga o'tdik.", business_connection_id)
-            return "OK", 200
-        elif text == "/normal":
-            chat_moods[chat_id] = "normal"
-            send_message(chat_id, "Odatdagi holatga qaytdik.", business_connection_id)
-            return "OK", 200
+            if text == "/hazil":
+                chat_moods[chat_id] = "hazil"
+                send_message(chat_id, "Bo'ldi, endi hazillashib gaplashamiz! 😄", business_connection_id)
+                return "OK", 200
+            elif text == "/jiddiy":
+                chat_moods[chat_id] = "jiddiy"
+                send_message(chat_id, "Tushunarli, jiddiy rejimga o'tdik.", business_connection_id)
+                return "OK", 200
+            elif text == "/normal":
+                chat_moods[chat_id] = "normal"
+                send_message(chat_id, "Odatdagi holatga qaytdik.", business_connection_id)
+                return "OK", 200
 
         if not is_admin(sender_id) and is_daily_limit_exceeded(chat_id):
             send_message(
@@ -749,7 +798,7 @@ def webhook():
 
             typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
             try:
-                answer = get_ai_answer(chat_id, user_content_for_ai, sender)
+                answer = get_ai_answer(chat_id, user_content_for_ai, sender, user_names.get(chat_id))
             finally:
                 stop_typing_loop(typing_thread, stop_typing_event)
 
