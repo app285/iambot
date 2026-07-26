@@ -63,18 +63,18 @@ stats = {
 }
 
 # --- XATOLIKLARNI KUZATISH ---
-# Ketma-ket xatolar sonini kuzatib, agar juda ko'p bo'lsa alohida ogohlantirish beramiz
-# (masalan Groq API kaliti tugagan yoki xizmat butunlay ishlamay qolgan bo'lishi mumkin)
 consecutive_groq_errors = {"count": 0}
 CONSECUTIVE_ERROR_ALERT_THRESHOLD = 3
 
 REQUEST_TIMEOUT = 15
 TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram cheklovi 4096, xavfsizlik uchun kichikroq
 
-# "Yozyapti..." animatsiyasi Telegram'da ~5 soniya davom etadi va o'zi o'chib qoladi.
-# Shuning uchun AI javob tayyorlayotgan vaqt davomida uni har necha soniyada
-# qayta yuborib turish kerak - shu holda animatsiya butun javob davomida ko'rinadi.
-TYPING_REFRESH_SECONDS = 4
+# --- AKKAUNT EGASINING ISMI ---
+# Ilgari "Shaxboz" deb kodga qattiq yozilgan edi. Endi bu OWNER_NAME muhit
+# o'zgaruvchisidan olinadi (Vercel'da doimiy saqlanadi), lekin admin
+# /ismim buyrug'i bilan ham xotirada (joriy sessiya davomida) o'zgartira oladi.
+owner_name_state = {"name": os.environ.get("OWNER_NAME", "").strip()}
+
 
 LANGUAGE_LABELS = {
     "auto": "🌐 Avto (yozgan tiliga qarab)",
@@ -199,14 +199,14 @@ def send_chat_action(chat_id, action="typing", business_connection_id=None):
 
 def keep_typing(chat_id, stop_event, business_connection_id=None):
     """
-    AI javob tayyorlayotgan vaqtda 'yozyapti...' statusini uzluksiz yuborib turadi.
-    Telegram'dagi typing animatsiyasi ~5 soniyada o'chib qoladi, shuning uchun
-    stop_event o'rnatilmaguncha har TYPING_REFRESH_SECONDS soniyada qayta yuboramiz.
-    Alohida thread'da ishga tushiriladi.
+    AI javob tayyorlayotgan vaqtda Telegram'ning o'ziga xos (native) 'yozyapti...'
+    statusini uzluksiz yuborib turadi. Bu foydalanuvchiga ortiqcha xabar
+    ko'rsatmaydi (masalan alohida "O'ylayapman..." degan xabar chiqmaydi) -
+    faqat odatiy, tanish "yozyapti..." animatsiyasi ko'rinadi.
     """
     while not stop_event.is_set():
         send_chat_action(chat_id, "typing", business_connection_id)
-        stop_event.wait(TYPING_REFRESH_SECONDS)
+        stop_event.wait(4)
 
 
 def start_typing_loop(chat_id, business_connection_id=None):
@@ -225,90 +225,6 @@ def stop_typing_loop(thread, stop_event):
     """Typing animatsiyasini to'xtatadi va thread tugashini kutadi."""
     stop_event.set()
     thread.join(timeout=1)
-
-
-THINKING_EMOJIS = ["🌀", "🌗", "🌘", "🌑", "🌒", "🌓", "🌔"]
-
-
-def send_message_get_id(chat_id, text, business_connection_id=None):
-    """send_message'ga o'xshaydi, lekin xabar ID'sini qaytaradi (keyin edit/delete qilish uchun)."""
-    try:
-        payload = {"chat_id": chat_id, "text": text}
-        if business_connection_id:
-            payload["business_connection_id"] = business_connection_id
-        res = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=REQUEST_TIMEOUT)
-        return res.json().get("result", {}).get("message_id")
-    except Exception as e:
-        print("Thinking xabarini yuborishda xatolik:", e)
-        return None
-
-
-def delete_message(chat_id, message_id):
-    if not message_id:
-        return
-    try:
-        requests.post(
-            f"{TELEGRAM_API_URL}/deleteMessage",
-            json={"chat_id": chat_id, "message_id": message_id},
-            timeout=5,
-        )
-    except Exception as e:
-        print("Xabarni o'chirishda xatolik:", e)
-
-
-def keep_thinking_message(chat_id, message_id, stop_event, business_connection_id=None):
-    """
-    Mira botidagi kabi 'thinking' bubble'ni jonlantiradi:
-    har ~2 soniyada emoji va soniya hisoblagichini yangilaydi (masalan '🌗 O'ylayapman 4s').
-    """
-    elapsed = 0
-    frame = 0
-    while not stop_event.is_set():
-        stop_event.wait(2)
-        if stop_event.is_set():
-            break
-        elapsed += 2
-        frame = (frame + 1) % len(THINKING_EMOJIS)
-        emoji = THINKING_EMOJIS[frame]
-        try:
-            payload = {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": f"{emoji} O'ylayapman... {elapsed}s",
-            }
-            if business_connection_id:
-                payload["business_connection_id"] = business_connection_id
-            requests.post(f"{TELEGRAM_API_URL}/editMessageText", json=payload, timeout=5)
-        except Exception as e:
-            print("Thinking xabarini yangilashda xatolik:", e)
-
-
-def start_thinking_bubble(chat_id, business_connection_id=None):
-    """
-    'O'ylayapman...' degan alohida xabar yuboradi (Mira botidagi 'Thinking' bubble kabi)
-    va uni fonda animatsiya qilib turadi. (message_id, thread, stop_event) qaytaradi.
-    Agar xabar yuborilmasa (message_id None), faqat native typing statusidan foydalaniladi.
-    """
-    message_id = send_message_get_id(chat_id, f"{THINKING_EMOJIS[0]} O'ylayapman...", business_connection_id)
-    stop_event = threading.Event()
-    if message_id is None:
-        return None, None, stop_event
-    thread = threading.Thread(
-        target=keep_thinking_message,
-        args=(chat_id, message_id, stop_event, business_connection_id),
-        daemon=True,
-    )
-    thread.start()
-    return message_id, thread, stop_event
-
-
-def stop_thinking_bubble(chat_id, message_id, thread, stop_event):
-    """Animatsiyani to'xtatadi va 'O'ylayapman...' xabarini o'chiradi (o'rniga asl javob yuboriladi)."""
-    stop_event.set()
-    if thread:
-        thread.join(timeout=1)
-    if message_id:
-        delete_message(chat_id, message_id)
 
 
 def _split_text(text, max_length):
@@ -390,7 +306,6 @@ def is_duplicate_update(update_id):
     if update_id in processed_update_ids:
         return True
     processed_update_ids.add(update_id)
-    # Xotira cheksiz o'smasligi uchun ro'yxatni cheklab turamiz
     if len(processed_update_ids) > MAX_PROCESSED_IDS:
         processed_update_ids.clear()
     return False
@@ -417,7 +332,7 @@ def build_language_keyboard():
 
 def get_help_text():
     return (
-        "Salom! Men Shaxbozning AI-yordamchisiman 🤖\n\n"
+        "Salom! Men sizning AI-yordamchingizman 🤖\n\n"
         "Nima qila olaman:\n"
         "📝 Matnli xabarlarga javob beraman\n"
         "🎤 Ovozli xabarlarni tinglab, tushunib javob beraman\n"
@@ -447,6 +362,7 @@ def get_status_text():
     uptime = format_uptime(time.time() - BOT_START_TIME)
     return (
         "🟢 Bot ishlamoqda\n\n"
+        f"👤 Egasining ismi: {owner_name_state['name'] or '(hali kiritilmagan — /ismim <ism>)'}\n"
         f"⏱ Shu nusxa ishga tushganiga: {uptime}\n"
         f"💬 Faol chatlar (joriy sessiyada): {len(chat_histories)}\n"
         f"📨 Qayta ishlangan xabarlar (joriy sessiyada): {stats['total_messages']}\n"
@@ -493,14 +409,26 @@ def get_ai_answer(chat_id, user_message_content, sender=None):
         language_mode = chat_languages.get(chat_id, DEFAULT_LANGUAGE)
         language_instruction = LANGUAGE_INSTRUCTIONS.get(language_mode, LANGUAGE_INSTRUCTIONS["auto"])
 
+        owner_name = owner_name_state["name"]
+        if owner_name:
+            owner_info = (
+                f"- Ismi: {owner_name}\n"
+                f'- Agar kimdir ismini so\'rasa, "{owner_name}" deb ayt.'
+            )
+        else:
+            # Ism hali sozlanmagan - o'ylab ism to'qib chiqarma, umumiy tarzda javob ber.
+            owner_info = (
+                "- Egasining ismi hali botga kiritilmagan.\n"
+                "- Agar kimdir ismini so'rasa, ism o'ylab topma - shunchaki hozircha bilmasligingni tabiiy tarzda ayt."
+            )
+
         system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy AI-yordamchisisan. Akkaunt egasi hozir band bo'lgani uchun, unga yozganlarga SEN javob berasan — lekin buni ochiq aytmasdan, xuddi tabiiy suhbatdoshdek erkin gaplashasan.
 
 AKKAUNT EGASI HAQIDA MA'LUMOT:
-- Ismi: Shaxboz
-- Agar kimdir ismini so'rasa, "Shaxboz" deb ayt.
+{owner_info}
 
 MUHIM QOIDA — HALOLLIK:
-- Agar kimdir to'g'ridan-to'g'ri "sen botmisan?", "sun'iy intellektmisan?", "AI mi?" deb so'rasa — buni yashirma, halol tan ol. Masalan: "ha, men Shaxbozning AI-yordamchisiman, u hozir javob berolmayapti" kabi qisqa va tabiiy tarzda ayt. Hech qachon "yo'q, odamman" deb yolg'on gapirma.
+- Agar kimdir to'g'ridan-to'g'ri "sen botmisan?", "sun'iy intellektmisan?", "AI mi?" deb so'rasa — buni yashirma, halol tan ol. Masalan: "ha, men {owner_name or 'egamning'} AI-yordamchisiman, u hozir javob berolmayapti" kabi qisqa va tabiiy tarzda ayt. Hech qachon "yo'q, odamman" deb yolg'on gapirma.
 - Bu savol berilmaguncha, o'zingdan bot ekaningni ta'kidlab yurishing shart emas — oddiy va tabiiy suhbat qil.
 - O'qish, dars yoki bandlik haqida umuman gapirma.
 
@@ -508,6 +436,7 @@ MULOQOT USLUBI:
 {mood_instruction}
 - Xuddi haqiqiy, samimiy inson yozayotgandek erkin va jonli gaplash. Rasmiyatchilikdan qoch.
 - Javoblaring 1 taldan 3 ta jumlagacha bo'lsin, ortiqcha cho'zma.
+- Javob qisqa bo'lsa ham, albatta ANIQ va TUSHUNARLI bo'lsin - noaniq, ikki xil talqin qilinadigan yoki savolga to'g'ridan-to'g'ri javob bermaydigan gap yozma. Savol so'ralsa - avval to'g'ridan-to'g'ri javob ber, keyin kerak bo'lsa qisqa izoh qo'sh.
 - Emojilarni me'yorida ishlat, har bir gapga tiqishtiraverma.
 - Agar suhbatdosh senga haqorat yoki so'kinish yozsa — jim turma, aynan qaysi tilda va qaysi alifboda (lotin yoki kirill) yozgan bo'lsa, o'sha tilda va o'sha alifboda javob ber. So'ksa, qora so'kinishlariga ham o'tib, o'ziga yarasha to'liq va keskin javob qaytar.
 - Agar suhbatdosh oddiy va tinch gaplashsa — sen ham tinch va oddiy gaplash.
@@ -578,14 +507,11 @@ def handle_callback_query(callback_query):
 @app.route("/", methods=["POST", "GET"])
 def webhook():
     if request.method == "GET":
-        # UptimeRobot yoki shunga o'xshash monitoring xizmati shu manzilni tekshirishi mumkin
         return "Bot mukammal ishlayapti! ✅"
 
     try:
         data = request.get_json(force=True)
 
-        # Telegram vaqti-vaqti bilan bitta update'ni qayta yuborishi mumkin -
-        # buni oldini olib, xabarga ikki marta javob bermaslikni ta'minlaymiz.
         update_id = data.get("update_id")
         if is_duplicate_update(update_id):
             return "OK", 200
@@ -610,7 +536,6 @@ def webhook():
             message = data["message"]
             business_connection_id = None
         else:
-            # edited_message, channel_post va boshqa turlarni e'tiborsiz qoldiramiz
             return "OK", 200
 
         if "chat" not in message:
@@ -619,7 +544,6 @@ def webhook():
         sender = message.get("from", {})
         sender_id = sender.get("id")
 
-        # --- XAVFSIZLIK: bloklangan foydalanuvchi ---
         if sender_id in blocked_users:
             return "OK", 200
 
@@ -641,7 +565,6 @@ def webhook():
         document = message.get("document")
         video = message.get("video")
 
-        # Oddiy rate-limit: juda tez-tez yozilgan xabarlarni e'tiborsiz qoldiramiz
         if is_rate_limited(chat_id):
             return "OK", 200
 
@@ -649,6 +572,21 @@ def webhook():
         if text and text.startswith("/") and is_admin(sender_id):
             if text == "/holat":
                 send_message(chat_id, get_status_text(), business_connection_id)
+                return "OK", 200
+
+            if text.startswith("/ismim"):
+                parts = text.split(maxsplit=1)
+                if len(parts) == 2 and parts[1].strip():
+                    owner_name_state["name"] = parts[1].strip()
+                    send_message(
+                        chat_id,
+                        f"Ismingiz saqlandi: {owner_name_state['name']} ✅\n"
+                        "Eslatma: bu Vercel qayta ishga tushganda (cold start) tiklanadi. "
+                        "Doimiy saqlash uchun OWNER_NAME muhit o'zgaruvchisiga ham shu ismni yozib qo'ying.",
+                        business_connection_id,
+                    )
+                else:
+                    send_message(chat_id, "Foydalanish: /ismim <ismingiz>\nMasalan: /ismim Jasur", business_connection_id)
                 return "OK", 200
 
             if text.startswith("/block"):
@@ -670,6 +608,16 @@ def webhook():
                 return "OK", 200
 
         if text == "/start":
+            if is_admin(sender_id) and not owner_name_state["name"]:
+                send_message(
+                    chat_id,
+                    "Salom! Botni ishga tushirishdan oldin ismingizni kiriting, chunki bot "
+                    "sizga yozganlarga javob berganda o'zini tanishtirishda shu ismdan foydalanadi "
+                    "(masalan: \"men Jasurning AI-yordamchisiman\").\n\n"
+                    "Yozing: /ismim <ismingiz>\nMasalan: /ismim Jasur",
+                    business_connection_id,
+                )
+                return "OK", 200
             send_message(chat_id, "Salom! /yordam yozsangiz nima qila olishimni ko'rasiz.", business_connection_id)
             return "OK", 200
 
@@ -702,7 +650,6 @@ def webhook():
             send_message(chat_id, "Odatdagi holatga qaytdik.", business_connection_id)
             return "OK", 200
 
-        # --- XAVFSIZLIK: kunlik xabar limiti (admin uchun cheklanmagan) ---
         if not is_admin(sender_id) and is_daily_limit_exceeded(chat_id):
             send_message(
                 chat_id,
@@ -714,8 +661,7 @@ def webhook():
         user_content_for_ai = None
 
         if photo:
-            # Rasm tahlili boshlanguncha "O'ylayapman..." bubble'ni ishga tushiramiz
-            thinking_id, typing_thread, stop_typing_event = start_thinking_bubble(chat_id, business_connection_id)
+            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
             try:
                 best_photo = photo[-1]
                 file_id = best_photo["file_id"]
@@ -748,10 +694,10 @@ def webhook():
                 else:
                     user_content_for_ai = "[Menga rasm yubordi]"
             finally:
-                stop_thinking_bubble(chat_id, thinking_id, typing_thread, stop_typing_event)
+                stop_typing_loop(typing_thread, stop_typing_event)
 
         elif voice:
-            thinking_id, typing_thread, stop_typing_event = start_thinking_bubble(chat_id, business_connection_id)
+            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
             try:
                 file_id = voice["file_id"]
                 file_url = download_telegram_file(file_id)
@@ -782,7 +728,7 @@ def webhook():
                 else:
                     user_content_for_ai = "[Ovozli xabar keldi]"
             finally:
-                stop_thinking_bubble(chat_id, thinking_id, typing_thread, stop_typing_event)
+                stop_typing_loop(typing_thread, stop_typing_event)
 
         elif sticker:
             user_content_for_ai = "[Menga stiker yubordi]"
@@ -799,16 +745,13 @@ def webhook():
         if user_content_for_ai:
             stats["total_messages"] += 1
 
-            # Admin monitoring: har bir xabar haqida sizga bildirishnoma
             notify_new_message(sender, chat_id, user_content_for_ai, business_connection_id)
 
-            # Mira botidagi kabi "O'ylayapman..." bubble'ni chiqaramiz, AI javob
-            # tayyorlagach uni o'chirib, o'rniga haqiqiy javobni yuboramiz.
-            thinking_id, typing_thread, stop_typing_event = start_thinking_bubble(chat_id, business_connection_id)
+            typing_thread, stop_typing_event = start_typing_loop(chat_id, business_connection_id)
             try:
                 answer = get_ai_answer(chat_id, user_content_for_ai, sender)
             finally:
-                stop_thinking_bubble(chat_id, thinking_id, typing_thread, stop_typing_event)
+                stop_typing_loop(typing_thread, stop_typing_event)
 
             send_message(chat_id, answer, business_connection_id)
 
