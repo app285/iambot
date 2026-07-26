@@ -1,6 +1,8 @@
 import os
+import re
 import time
 import json
+import random
 import datetime
 import threading
 import requests
@@ -170,6 +172,78 @@ LANGUAGE_INSTRUCTIONS = {
 
 
 # ---------------------------------------------------------------------------
+# CUSTOM EMOJI VA PREMIUM STIKERLAR
+# ---------------------------------------------------------------------------
+# Bu ikki ro'yxatni to'ldirish uchun botga /getid buyrug'ini yuboring, keyin
+# istagan custom emoji (matn ichida) yoki stikerni yuboring - bot ID'sini
+# chiqarib beradi. Chiqqan ID'ni shu yerga qo'shib qo'ysangiz bo'ldi.
+#
+# CUSTOM_EMOJIS: AI javobida qaysi holatda qaysi emoji ishlatilishini
+# bog'laydigan kalit so'zlar. Kalit nomini o'zingiz xohlagancha qo'yishingiz
+# mumkin - faqat get_ai_answer() ichidagi system_prompt'da ham shu nomlar
+# aytilgan bo'lishi kerak (pastda avtomatik ro'yxatdan generatsiya qilinadi).
+CUSTOM_EMOJIS = {
+    # "kalit_nomi": {"emoji": "ko'rinadigan_belgi", "id": "custom_emoji_id"},
+    # "kulgi": {"emoji": "😂", "id": "5368324170671202286"},
+    # "yurak": {"emoji": "❤️", "id": "XXXXXXXXXXXXXXXXX"},
+    # "olov":  {"emoji": "🔥", "id": "XXXXXXXXXXXXXXXXX"},
+    # "rozi":  {"emoji": "👍", "id": "XXXXXXXXXXXXXXXXX"},
+}
+
+# PREMIUM_STICKERS: bot vaqti-vaqti bilan (tasodifiy) yuborishi mumkin
+# bo'lgan stikerlarning file_id ro'yxati.
+PREMIUM_STICKERS = [
+    # "CAACAgIAAxkBAAIB...",
+    # "CAACAgIAAxkBAAIC...",
+]
+
+# Har nechinchi javobda stiker yuborish ehtimoli (0.1 = ~10% xabarda bitta stiker)
+STICKER_SEND_CHANCE = 0.08
+
+# /getid buyrug'idan keyin javob (emoji/stiker) kutilayotgan admin chat'lari
+awaiting_id_chats = set()
+
+
+def build_custom_emoji_entity(emoji_key, offset):
+    """Berilgan kalit nomi bo'yicha custom_emoji entity yaratadi. Topilmasa None qaytaradi."""
+    info = CUSTOM_EMOJIS.get(emoji_key)
+    if not info:
+        return None, ""
+    # Telegram entity uzunligi UTF-16 birliklarda hisoblanadi (ba'zi emojilar 2 birlik).
+    length = len(info["emoji"].encode("utf-16-le")) // 2
+    entity = {
+        "type": "custom_emoji",
+        "offset": offset,
+        "length": length,
+        "custom_emoji_id": info["id"],
+    }
+    return entity, info["emoji"]
+
+
+EMOJI_TAG_PATTERN = re.compile(r"\s*\[EMOJI:(\w+)\]\s*")
+
+
+def extract_emoji_tag(answer):
+    """AI javobidagi [EMOJI:kalit] belgisini ajratib oladi va matndan olib tashlaydi."""
+    match = EMOJI_TAG_PATTERN.search(answer)
+    if not match:
+        return answer, None
+    key = match.group(1)
+    clean_answer = EMOJI_TAG_PATTERN.sub(" ", answer).strip()
+    return clean_answer, key
+
+
+def maybe_send_premium_sticker(chat_id, business_connection_id=None):
+    """Ba'zan (tasodifiy) premium stikerlardan birini yuboradi."""
+    if not PREMIUM_STICKERS:
+        return
+    if random.random() > STICKER_SEND_CHANCE:
+        return
+    file_id = random.choice(PREMIUM_STICKERS)
+    send_sticker(chat_id, file_id, business_connection_id)
+
+
+# ---------------------------------------------------------------------------
 # ADMIN MONITORING
 # ---------------------------------------------------------------------------
 
@@ -316,7 +390,7 @@ def _split_text(text, max_length):
     return parts
 
 
-def send_message(chat_id, text, business_connection_id=None, reply_markup=None):
+def send_message(chat_id, text, business_connection_id=None, reply_markup=None, entities=None):
     if not text:
         return
     chunks = _split_text(text, TELEGRAM_MAX_MESSAGE_LENGTH)
@@ -328,9 +402,24 @@ def send_message(chat_id, text, business_connection_id=None, reply_markup=None):
             # Tugmalarni faqat oxirgi qismga qo'shamiz
             if reply_markup and i == len(chunks) - 1:
                 payload["reply_markup"] = reply_markup
+            # Custom emoji entity'larni faqat birinchi qismga qo'shamiz
+            # (chunki offset shu qismga nisbatan hisoblangan)
+            if entities and i == 0:
+                payload["entities"] = entities
             requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             print("Telegramga yuborishda xatolik:", e)
+
+
+def send_sticker(chat_id, file_id, business_connection_id=None):
+    """Berilgan file_id bo'yicha stiker (jumladan premium stiker) yuboradi."""
+    try:
+        payload = {"chat_id": chat_id, "sticker": file_id}
+        if business_connection_id:
+            payload["business_connection_id"] = business_connection_id
+        requests.post(f"{TELEGRAM_API_URL}/sendSticker", json=payload, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        print("Stiker yuborishda xatolik:", e)
 
 
 def answer_callback_query(callback_query_id, text=None):
@@ -439,7 +528,9 @@ def get_status_text():
         f"💬 Faol chatlar (joriy sessiyada): {len(chat_histories)}\n"
         f"📨 Qayta ishlangan xabarlar (joriy sessiyada): {stats['total_messages']}\n"
         f"⚠️ Xatoliklar (joriy sessiyada): {stats['total_errors']}\n"
-        f"🚫 Bloklangan foydalanuvchilar: {len(blocked_users)}\n\n"
+        f"🚫 Bloklangan foydalanuvchilar: {len(blocked_users)}\n"
+        f"😀 Custom emoji sozlangan: {len(CUSTOM_EMOJIS)} ta\n"
+        f"🏷 Premium stiker sozlangan: {len(PREMIUM_STICKERS)} ta\n\n"
         "Eslatma: bu ko'rsatkichlar Vercel qayta ishga tushganda (cold start) nolga tushadi."
     )
 
@@ -474,6 +565,20 @@ def get_fallback_message(chat_id):
     """Groq/API xato bergan holatda foydalanuvchi tanlagan tilga mos, iliqroq xabar qaytaradi."""
     language_mode = chat_languages.get(chat_id, DEFAULT_LANGUAGE)
     return FALLBACK_MESSAGES.get(language_mode, FALLBACK_MESSAGES["auto"])
+
+
+def build_emoji_instruction():
+    """CUSTOM_EMOJIS ro'yxatidan AI uchun tushunarli yo'riqnoma matnini yasaydi."""
+    if not CUSTOM_EMOJIS:
+        return ""
+    keys_list = ", ".join(f"[EMOJI:{k}]" for k in CUSTOM_EMOJIS.keys())
+    return (
+        "\n\nMAXSUS EMOJI QOIDASI:\n"
+        f"Agar javobing juda quvnoq, hazil, hayajonli yoki iliq bo'lsa, javobingning ENG "
+        f"OXIRIGA mos keladigan bittasini qo'sh: {keys_list}. Bu belgi keyinchalik haqiqiy "
+        "emojiga almashtiriladi, foydalanuvchi uni matn sifatida ko'rmaydi. Har javobda emas, "
+        "faqat rostdan mos kelganda ishlat. Aks holda hech narsa qo'shma."
+    )
 
 
 def get_ai_answer(chat_id, user_message_content, sender=None, user_name=None):
@@ -514,6 +619,8 @@ def get_ai_answer(chat_id, user_message_content, sender=None, user_name=None):
         else:
             visitor_info = "- Suhbatdoshning ismi hali noma'lum."
 
+        emoji_instruction = build_emoji_instruction()
+
         system_prompt = f"""Sen Telegram akkaunt egasining shaxsiy AI-yordamchisisan. Akkaunt egasi hozir band bo'lgani uchun, unga yozganlarga SEN javob berasan — lekin buni ochiq aytmasdan, xuddi tabiiy suhbatdoshdek erkin gaplashasan.
 
 AKKAUNT EGASI HAQIDA MA'LUMOT:
@@ -537,7 +644,7 @@ MULOQOT USLUBI:
 - Agar suhbatdosh oddiy va tinch gaplashsa — sen ham tinch va oddiy gaplash.
 
 🔴 TIL VA ALIFBO QOIDASI:
-{language_instruction}"""
+{language_instruction}{emoji_instruction}"""
 
         messages_payload = [{"role": "system", "content": system_prompt}] + chat_histories[chat_id]
 
@@ -662,6 +769,46 @@ def webhook():
         video = message.get("video")
 
         if is_rate_limited(chat_id):
+            return "OK", 200
+
+        # --- ADMIN: /getid BUYRUG'I VA UNGA JAVOB ---
+        # /getid dan keyin admin yuborgan istalgan xabar (matn ichidagi custom
+        # emoji YOKI stiker) tekshiriladi va ID'lari chiqarib beriladi. Shu
+        # ID'larni CUSTOM_EMOJIS / PREMIUM_STICKERS ro'yxatlariga qo'shib
+        # qo'yasiz.
+        if is_admin(sender_id) and text == "/getid":
+            awaiting_id_chats.add(chat_id)
+            send_message(
+                chat_id,
+                "Yaxshi 👍 Endi custom emoji (matn ichida yuboring) yoki stiker yuboring — "
+                "men uning ID'sini chiqarib beraman.",
+                business_connection_id,
+            )
+            return "OK", 200
+
+        if is_admin(sender_id) and chat_id in awaiting_id_chats:
+            awaiting_id_chats.discard(chat_id)
+            result_lines = []
+
+            if sticker:
+                result_lines.append(f"🏷 Stiker file_id:\n{sticker.get('file_id')}")
+                if sticker.get("emoji"):
+                    result_lines.append(f"Emoji: {sticker.get('emoji')}")
+                if sticker.get("set_name"):
+                    result_lines.append(f"To'plam: {sticker.get('set_name')}")
+
+            entities_in_msg = message.get("entities", [])
+            custom_emojis_found = [e for e in entities_in_msg if e.get("type") == "custom_emoji"]
+            for e in custom_emojis_found:
+                result_lines.append(
+                    f"\n😀 Custom emoji ID: {e.get('custom_emoji_id')} "
+                    f"(offset={e.get('offset')}, length={e.get('length')})"
+                )
+
+            if not result_lines:
+                result_lines.append("Hech qanday custom emoji yoki stiker topilmadi 🤔 Qayta /getid yozib urinib ko'ring.")
+
+            send_message(chat_id, "\n".join(result_lines), business_connection_id)
             return "OK", 200
 
         # --- ADMIN: /ismim BUYRUG'I ---
@@ -886,7 +1033,21 @@ def webhook():
             finally:
                 stop_typing_loop(typing_thread, stop_typing_event)
 
-            send_message(chat_id, answer, business_connection_id)
+            # AI javobidagi [EMOJI:kalit] belgisini haqiqiy custom emoji bilan almashtiramiz.
+            clean_answer, emoji_key = extract_emoji_tag(answer)
+            entities = None
+            final_text = clean_answer
+
+            if emoji_key:
+                entity, emoji_char = build_custom_emoji_entity(emoji_key, offset=len(clean_answer) + 1)
+                if entity:
+                    final_text = f"{clean_answer} {emoji_char}"
+                    entities = [entity]
+
+            send_message(chat_id, final_text, business_connection_id, entities=entities)
+
+            # Ba'zan (tasodifiy) premium stiker ham qo'shib yuboramiz.
+            maybe_send_premium_sticker(chat_id, business_connection_id)
 
         return "OK", 200
 
