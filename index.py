@@ -172,44 +172,59 @@ LANGUAGE_INSTRUCTIONS = {
 
 
 # ---------------------------------------------------------------------------
-# CUSTOM EMOJI VA PREMIUM STIKERLAR
+# CUSTOM EMOJI VA PREMIUM STIKERLAR (avtomatik, doimiy saqlanadi)
 # ---------------------------------------------------------------------------
-# Bu ikki ro'yxatni to'ldirish uchun botga /getid buyrug'ini yuboring, keyin
-# istagan custom emoji (matn ichida) yoki stikerni yuboring - bot ID'sini
-# chiqarib beradi. Chiqqan ID'ni shu yerga qo'shib qo'ysangiz bo'ldi.
+# Bu yerda hech narsani qo'lda yozish shart emas. Ishlash tartibi:
+#   1. Botga /getid yozasiz
+#   2. Custom emoji (matn ichida) yoki stiker yuborasiz
+#   3. Bot so'raydi: "Bu qaysi kayfiyat/holat uchun?" - bir so'z bilan
+#      javob berasiz (masalan: kulgi, quvonch, rozilik, afsus...)
+#   4. Bot buni Upstash Redis'ga DOIMIY saqlaydi - kodga qaytib kirish shart
+#      emas. AI keyinchalik shu kategoriyalardan mosini o'zi tanlab ishlatadi.
 #
-# CUSTOM_EMOJIS: AI javobida qaysi holatda qaysi emoji ishlatilishini
-# bog'laydigan kalit so'zlar. Kalit nomini o'zingiz xohlagancha qo'yishingiz
-# mumkin - faqat get_ai_answer() ichidagi system_prompt'da ham shu nomlar
-# aytilgan bo'lishi kerak (pastda avtomatik ro'yxatdan generatsiya qilinadi).
-CUSTOM_EMOJIS = {
-    # "kalit_nomi": {"emoji": "ko'rinadigan_belgi", "id": "custom_emoji_id"},
-    # "kulgi": {"emoji": "😂", "id": "5368324170671202286"},
-    # "yurak": {"emoji": "❤️", "id": "XXXXXXXXXXXXXXXXX"},
-    # "olov":  {"emoji": "🔥", "id": "XXXXXXXXXXXXXXXXX"},
-    # "rozi":  {"emoji": "👍", "id": "XXXXXXXXXXXXXXXXX"},
-}
+# Tuzilishi: { "kategoriya_nomi": {"emojis": [{"emoji": "😂", "id": "..."}],
+#                                   "stickers": ["file_id1", "file_id2"]} }
+custom_reactions = kv_load("custom_reactions", {})
 
-# PREMIUM_STICKERS: bot vaqti-vaqti bilan (tasodifiy) yuborishi mumkin
-# bo'lgan stikerlarning file_id ro'yxati.
-PREMIUM_STICKERS = [
-    # "CAACAgIAAxkBAAIB...",
-    # "CAACAgIAAxkBAAIC...",
-]
+# Har nechinchi javobda mos kategoriyadan stiker HAM qo'shib yuborish ehtimoli
+STICKER_WITH_REACTION_CHANCE = 0.5
 
-# Har nechinchi javobda stiker yuborish ehtimoli (0.1 = ~10% xabarda bitta stiker)
-STICKER_SEND_CHANCE = 0.08
-
-# /getid buyrug'idan keyin javob (emoji/stiker) kutilayotgan admin chat'lari
+# /getid buyrug'idan keyin item (emoji/stiker) kutilayotgan admin chat'lari
 awaiting_id_chats = set()
 
 
-def build_custom_emoji_entity(emoji_key, offset):
-    """Berilgan kalit nomi bo'yicha custom_emoji entity yaratadi. Topilmasa None qaytaradi."""
-    info = CUSTOM_EMOJIS.get(emoji_key)
-    if not info:
+def save_custom_reactions():
+    kv_save("custom_reactions", custom_reactions)
+
+
+def add_reaction_to_category(category, item_type, item_value):
+    """Yangi emoji/stiker'ni berilgan kategoriyaga qo'shadi va doimiy saqlaydi."""
+    category = category.strip().lower().replace(" ", "_")[:30]
+    if not category:
+        return None
+    bucket = custom_reactions.setdefault(category, {"emojis": [], "stickers": []})
+    if item_type == "emoji":
+        bucket["emojis"].append(item_value)  # {"emoji": "...", "id": "..."}
+    elif item_type == "sticker":
+        bucket["stickers"].append(item_value)  # file_id
+    save_custom_reactions()
+    return category
+
+
+def get_available_categories():
+    """Kamida bitta emoji yoki stiker'i bor kategoriyalar ro'yxati."""
+    return [
+        cat for cat, bucket in custom_reactions.items()
+        if bucket.get("emojis") or bucket.get("stickers")
+    ]
+
+
+def build_custom_emoji_entity(category, offset):
+    """Berilgan kategoriyadan tasodifiy bitta custom emoji tanlab, entity yaratadi."""
+    bucket = custom_reactions.get(category)
+    if not bucket or not bucket.get("emojis"):
         return None, ""
-    # Telegram entity uzunligi UTF-16 birliklarda hisoblanadi (ba'zi emojilar 2 birlik).
+    info = random.choice(bucket["emojis"])
     length = len(info["emoji"].encode("utf-16-le")) // 2
     entity = {
         "type": "custom_emoji",
@@ -220,26 +235,64 @@ def build_custom_emoji_entity(emoji_key, offset):
     return entity, info["emoji"]
 
 
-EMOJI_TAG_PATTERN = re.compile(r"\s*\[EMOJI:(\w+)\]\s*")
+def classify_reaction_category(emoji_char, sticker_hint=None):
+    """
+    Berilgan emoji belgisi (yoki stikerga biriktirilgan emoji) qanday kayfiyat/holatni
+    anglatishini Groq yordamida avtomatik aniqlaydi. Imkon qadar mavjud kategoriyalardan
+    birini qaytaradi (takrorlanishni oldini olish uchun), aks holda yangi qisqa nom.
+    """
+    existing = get_available_categories()
+    hint = emoji_char or sticker_hint or ""
+    try:
+        prompt = (
+            "Sen custom emoji yoki stikerlarni kayfiyat/holat toifasiga ajratuvchi yordamchisan.\n"
+            f"Mavjud toifalar: {', '.join(existing) if existing else '(hali yo\u2018q)'}\n"
+            f"Belgi: {hint}\n\n"
+            "Shu belgini eng mos toifaga joylashtir. Agar mavjud toifalardan biriga aniq mos "
+            "kelsa - aynan o'shani qaytar. Aks holda yangi, qisqa (bitta so'z, lotin harflarida, "
+            "kichik harf, bo'shliqsiz, o'zbekcha yoki umumtushunarli) toifa nomi taklif qil "
+            "(masalan: kulgi, quvonch, rozilik, afsus, gap, olov, yurak, hafsala).\n"
+            "FAQAT bitta so'z bilan javob ber, boshqa hech narsa yozma."
+        )
+        completion = call_groq_with_retry(
+            lambda: groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=TEXT_MODEL,
+                timeout=REQUEST_TIMEOUT,
+                max_tokens=10,
+            )
+        )
+        raw = completion.choices[0].message.content.strip().lower()
+        category = re.sub(r"[^a-z0-9_]", "", raw)[:30]
+        return category or "boshqa"
+    except Exception as e:
+        print("Kategoriya aniqlashda xatolik:", e)
+        return "boshqa"
 
 
-def extract_emoji_tag(answer):
-    """AI javobidagi [EMOJI:kalit] belgisini ajratib oladi va matndan olib tashlaydi."""
-    match = EMOJI_TAG_PATTERN.search(answer)
+REACT_TAG_PATTERN = re.compile(r"\s*\[REACT:(\w+)\]\s*")
+
+
+def extract_react_tag(answer):
+    """AI javobidagi [REACT:kategoriya] belgisini ajratib oladi va matndan olib tashlaydi."""
+    match = REACT_TAG_PATTERN.search(answer)
     if not match:
         return answer, None
-    key = match.group(1)
-    clean_answer = EMOJI_TAG_PATTERN.sub(" ", answer).strip()
-    return clean_answer, key
+    category = match.group(1).lower()
+    clean_answer = REACT_TAG_PATTERN.sub(" ", answer).strip()
+    return clean_answer, category
 
 
-def maybe_send_premium_sticker(chat_id, business_connection_id=None):
-    """Ba'zan (tasodifiy) premium stikerlardan birini yuboradi."""
-    if not PREMIUM_STICKERS:
+def maybe_send_matching_sticker(chat_id, category, business_connection_id=None):
+    """Agar tanlangan kategoriyada stiker bo'lsa, ehtimollik asosida yuboradi."""
+    if not category:
         return
-    if random.random() > STICKER_SEND_CHANCE:
+    bucket = custom_reactions.get(category)
+    if not bucket or not bucket.get("stickers"):
         return
-    file_id = random.choice(PREMIUM_STICKERS)
+    if random.random() > STICKER_WITH_REACTION_CHANCE:
+        return
+    file_id = random.choice(bucket["stickers"])
     send_sticker(chat_id, file_id, business_connection_id)
 
 
@@ -529,8 +582,8 @@ def get_status_text():
         f"📨 Qayta ishlangan xabarlar (joriy sessiyada): {stats['total_messages']}\n"
         f"⚠️ Xatoliklar (joriy sessiyada): {stats['total_errors']}\n"
         f"🚫 Bloklangan foydalanuvchilar: {len(blocked_users)}\n"
-        f"😀 Custom emoji sozlangan: {len(CUSTOM_EMOJIS)} ta\n"
-        f"🏷 Premium stiker sozlangan: {len(PREMIUM_STICKERS)} ta\n\n"
+        f"😀 Reaksiya kategoriyalari: {len(get_available_categories())} ta "
+        f"({', '.join(get_available_categories()) if get_available_categories() else 'hali yoq'})\n\n"
         "Eslatma: bu ko'rsatkichlar Vercel qayta ishga tushganda (cold start) nolga tushadi."
     )
 
@@ -568,16 +621,19 @@ def get_fallback_message(chat_id):
 
 
 def build_emoji_instruction():
-    """CUSTOM_EMOJIS ro'yxatidan AI uchun tushunarli yo'riqnoma matnini yasaydi."""
-    if not CUSTOM_EMOJIS:
+    """Mavjud kategoriyalar asosida AI uchun tushunarli yo'riqnoma matnini yasaydi."""
+    categories = get_available_categories()
+    if not categories:
         return ""
-    keys_list = ", ".join(f"[EMOJI:{k}]" for k in CUSTOM_EMOJIS.keys())
+    tags_list = ", ".join(f"[REACT:{c}]" for c in categories)
     return (
-        "\n\nMAXSUS EMOJI QOIDASI:\n"
-        f"Agar javobing juda quvnoq, hazil, hayajonli yoki iliq bo'lsa, javobingning ENG "
-        f"OXIRIGA mos keladigan bittasini qo'sh: {keys_list}. Bu belgi keyinchalik haqiqiy "
-        "emojiga almashtiriladi, foydalanuvchi uni matn sifatida ko'rmaydi. Har javobda emas, "
-        "faqat rostdan mos kelganda ishlat. Aks holda hech narsa qo'shma."
+        "\n\nMAXSUS REAKSIYA QOIDASI:\n"
+        f"Javobingning kayfiyatiga eng mos keladigan holatlardan biri bo'lsa, javobingning "
+        f"ENG OXIRIGA shu belgilardan bittasini qo'sh: {tags_list} "
+        "(masalan kulgi bo'lsa [REACT:kulgi], quvonch bo'lsa [REACT:quvonch] kabi - "
+        "kategoriya nomi mazmuniga qarab tanla). Bu belgi keyinchalik haqiqiy emoji/stikerga "
+        "almashtiriladi, foydalanuvchi belgini matn sifatida hech qachon ko'rmaydi. Har javobda "
+        "emas, faqat rostdan mos kelganda ishlat. Aks holda hech narsa qo'shma."
     )
 
 
@@ -771,44 +827,64 @@ def webhook():
         if is_rate_limited(chat_id):
             return "OK", 200
 
-        # --- ADMIN: /getid BUYRUG'I VA UNGA JAVOB ---
-        # /getid dan keyin admin yuborgan istalgan xabar (matn ichidagi custom
-        # emoji YOKI stiker) tekshiriladi va ID'lari chiqarib beriladi. Shu
-        # ID'larni CUSTOM_EMOJIS / PREMIUM_STICKERS ro'yxatlariga qo'shib
-        # qo'yasiz.
+        # --- ADMIN: /getid BUYRUG'I (TO'LIQ AVTOMATIK) ---
+        # /getid -> admin custom emoji yoki stiker yuboradi -> bot uning
+        # ma'nosini (emoji belgisi orqali) AI yordamida o'zi aniqlaydi va
+        # Redis'ga DOIMIY saqlaydi. Hech qanday qo'shimcha yozish shart emas.
         if is_admin(sender_id) and text == "/getid":
             awaiting_id_chats.add(chat_id)
             send_message(
                 chat_id,
-                "Yaxshi 👍 Endi custom emoji (matn ichida yuboring) yoki stiker yuboring — "
-                "men uning ID'sini chiqarib beraman.",
+                "Yaxshi 👍 Endi custom emoji (matn ichida) yoki stiker yuboring — "
+                "qolganini o'zim aniqlab, saqlab qo'yaman.",
                 business_connection_id,
             )
             return "OK", 200
 
         if is_admin(sender_id) and chat_id in awaiting_id_chats:
             awaiting_id_chats.discard(chat_id)
-            result_lines = []
+            pending_item = None
+            classify_hint = None
 
             if sticker:
-                result_lines.append(f"🏷 Stiker file_id:\n{sticker.get('file_id')}")
-                if sticker.get("emoji"):
-                    result_lines.append(f"Emoji: {sticker.get('emoji')}")
-                if sticker.get("set_name"):
-                    result_lines.append(f"To'plam: {sticker.get('set_name')}")
+                pending_item = {"type": "sticker", "value": sticker.get("file_id")}
+                classify_hint = sticker.get("emoji")
+            else:
+                entities_in_msg = message.get("entities", [])
+                custom_emojis_found = [e for e in entities_in_msg if e.get("type") == "custom_emoji"]
+                if custom_emojis_found:
+                    e = custom_emojis_found[0]
+                    offset = e.get("offset", 0)
+                    length = e.get("length", 0)
+                    # UTF-16 offset/length'dan haqiqiy emoji belgisini ajratib olamiz
+                    utf16_text = (text or "").encode("utf-16-le")
+                    emoji_slice = utf16_text[offset * 2: (offset + length) * 2]
+                    emoji_char = emoji_slice.decode("utf-16-le", errors="ignore")
+                    pending_item = {
+                        "type": "emoji",
+                        "value": {"emoji": emoji_char, "id": e.get("custom_emoji_id")},
+                    }
+                    classify_hint = emoji_char
 
-            entities_in_msg = message.get("entities", [])
-            custom_emojis_found = [e for e in entities_in_msg if e.get("type") == "custom_emoji"]
-            for e in custom_emojis_found:
-                result_lines.append(
-                    f"\n😀 Custom emoji ID: {e.get('custom_emoji_id')} "
-                    f"(offset={e.get('offset')}, length={e.get('length')})"
+            if not pending_item:
+                send_message(
+                    chat_id,
+                    "Hech qanday custom emoji yoki stiker topilmadi 🤔 Qayta /getid yozib urinib ko'ring.",
+                    business_connection_id,
                 )
+                return "OK", 200
 
-            if not result_lines:
-                result_lines.append("Hech qanday custom emoji yoki stiker topilmadi 🤔 Qayta /getid yozib urinib ko'ring.")
+            detected_category = classify_reaction_category(classify_hint)
+            category = add_reaction_to_category(detected_category, pending_item["type"], pending_item["value"])
 
-            send_message(chat_id, "\n".join(result_lines), business_connection_id)
+            send_message(
+                chat_id,
+                f"Saqlandi! ✅ Aniqlangan toifa: \"{category}\"\n"
+                f"Hozirgi barcha toifalar: {', '.join(get_available_categories())}\n\n"
+                "Agar toifa noto'g'ri bo'lsa, hech gap yo'q - yana shu turdagi emoji/stiker "
+                "yuborsangiz, o'z-o'zidan bir xil nomga to'planaveradi.",
+                business_connection_id,
+            )
             return "OK", 200
 
         # --- ADMIN: /ismim BUYRUG'I ---
@@ -1033,21 +1109,21 @@ def webhook():
             finally:
                 stop_typing_loop(typing_thread, stop_typing_event)
 
-            # AI javobidagi [EMOJI:kalit] belgisini haqiqiy custom emoji bilan almashtiramiz.
-            clean_answer, emoji_key = extract_emoji_tag(answer)
+            # AI javobidagi [REACT:kategoriya] belgisini haqiqiy custom emoji/stikerga almashtiramiz.
+            clean_answer, react_category = extract_react_tag(answer)
             entities = None
             final_text = clean_answer
 
-            if emoji_key:
-                entity, emoji_char = build_custom_emoji_entity(emoji_key, offset=len(clean_answer) + 1)
+            if react_category:
+                entity, emoji_char = build_custom_emoji_entity(react_category, offset=len(clean_answer) + 1)
                 if entity:
                     final_text = f"{clean_answer} {emoji_char}"
                     entities = [entity]
 
             send_message(chat_id, final_text, business_connection_id, entities=entities)
 
-            # Ba'zan (tasodifiy) premium stiker ham qo'shib yuboramiz.
-            maybe_send_premium_sticker(chat_id, business_connection_id)
+            # Mos kategoriyada stiker bo'lsa, ehtimollik asosida uni ham yuboramiz.
+            maybe_send_matching_sticker(chat_id, react_category, business_connection_id)
 
         return "OK", 200
 
