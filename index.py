@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import datetime
 import threading
 import requests
@@ -18,6 +19,69 @@ if not TELEGRAM_TOKEN or not GROQ_API_KEY:
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 groq_client = Groq(api_key=GROQ_API_KEY)
 
+# ---------------------------------------------------------------------------
+# DOIMIY SAQLASH (ixtiyoriy)
+# ---------------------------------------------------------------------------
+# Vercel har safar sovuq ishga tushganda (cold start) barcha oddiy Python
+# dictionary'lar tozalanadi. Shuning uchun ism, til, kayfiyat kabi
+# sozlamalarni doimiy saqlash uchun (ixtiyoriy) Upstash Redis ishlatiladi -
+# https://upstash.com dan bepul akkaunt ochib, "Redis" bazasi yaratib,
+# undan olingan REST URL va TOKEN'ni quyidagi ikkita muhit o'zgaruvchisiga
+# qo'yish kifoya:
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+# Agar bu ikkalasi kiritilmagan bo'lsa, bot avvalgidek faqat xotirada (RAM)
+# ishlayveradi - hech narsa buzilmaydi, faqat cold start'da sozlamalar
+# tiklanadi.
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+PERSISTENCE_ENABLED = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+
+
+def _kv_headers():
+    return {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+
+
+def kv_load(key, default):
+    """Upstash Redis'dan saqlangan qiymatni o'qiydi. Ulanmagan yoki xato bo'lsa - default qaytadi."""
+    if not PERSISTENCE_ENABLED:
+        return default
+    try:
+        res = requests.get(f"{UPSTASH_REDIS_REST_URL}/get/{key}", headers=_kv_headers(), timeout=5)
+        raw = res.json().get("result")
+        if raw is None:
+            return default
+        return json.loads(raw)
+    except Exception as e:
+        print(f"KV o'qishda xatolik ({key}):", e)
+        return default
+
+
+def kv_save(key, value):
+    """Qiymatni Upstash Redis'ga yozadi. Ulanmagan bo'lsa - hech narsa qilmaydi (xatoni yutib yuboradi)."""
+    if not PERSISTENCE_ENABLED:
+        return
+    try:
+        requests.post(
+            f"{UPSTASH_REDIS_REST_URL}/set/{key}",
+            headers=_kv_headers(),
+            data=json.dumps(value),
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"KV yozishda xatolik ({key}):", e)
+
+
+def _keys_to_int(d):
+    """JSON'dan qaytgan dictionary kalitlari doim string bo'ladi - chat_id sifatida int kerak."""
+    result = {}
+    for k, v in d.items():
+        try:
+            result[int(k)] = v
+        except (TypeError, ValueError):
+            result[k] = v
+    return result
+
 # --- MODELLAR ---
 TEXT_MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "qwen/qwen3.6-27b"  # hozircha "preview" statusida - vaqti-vaqti bilan tekshirib turing
@@ -30,17 +94,17 @@ chat_histories = {}
 MAX_HISTORY_LENGTH = 10
 
 # Kayfiyat rejimlari uchun xotira
-chat_moods = {}
+chat_moods = _keys_to_int(kv_load("chat_moods", {}))
 
 # Majburiy til rejimi: chat_id -> "auto" | "en" | "uz_latin" | "uz_cyrillic" | "ru"
-chat_languages = {}
+chat_languages = _keys_to_int(kv_load("chat_languages", {}))
 DEFAULT_LANGUAGE = "auto"
 
 # Botga to'g'ridan-to'g'ri yozgan har bir foydalanuvchining ismi (shaxsiy
 # murojaat qilish uchun): chat_id -> ism. Business chat'larga (odam sizning
 # shaxsiy akkountingizga yozganda) bu tegishli emas - u yerda bot sizning
 # nomingizdan gapiradi, o'zi alohida "foydalanuvchi" emas.
-user_names = {}
+user_names = _keys_to_int(kv_load("user_names", {}))
 # Ismi hali so'ralgan, lekin javob kelmagan chat_id'lar to'plami.
 awaiting_name_chats = set()
 
@@ -58,7 +122,7 @@ MAX_PROCESSED_IDS = 2000
 
 # --- XAVFSIZLIK ---
 # Bloklangan foydalanuvchilar (user_id to'plami)
-blocked_users = set()
+blocked_users = set(kv_load("blocked_users", []))
 
 # Kunlik xabar limiti: chat_id -> {"date": "YYYY-MM-DD", "count": n}
 daily_usage = {}
@@ -81,7 +145,7 @@ TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Telegram cheklovi 4096, xavfsizlik uchun k
 # Ilgari "Shaxboz" deb kodga qattiq yozilgan edi. Endi bu OWNER_NAME muhit
 # o'zgaruvchisidan olinadi (Vercel'da doimiy saqlanadi), lekin admin
 # /ismim buyrug'i bilan ham xotirada (joriy sessiya davomida) o'zgartira oladi.
-owner_name_state = {"name": os.environ.get("OWNER_NAME", "").strip()}
+owner_name_state = {"name": kv_load("owner_name", os.environ.get("OWNER_NAME", "").strip())}
 
 
 LANGUAGE_LABELS = {
@@ -370,7 +434,7 @@ def get_status_text():
     uptime = format_uptime(time.time() - BOT_START_TIME)
     return (
         "🟢 Bot ishlamoqda\n\n"
-        f"👤 Egasining ismi: {owner_name_state['name'] or '(hali kiritilmagan — /ismim <ism>)'}\n"
+        f"👤 Egasining ismi: {owner_name_state['name'] or '(hali kiritilmagan — /ismim Jasur kabi yozing)'}\n"
         f"⏱ Shu nusxa ishga tushganiga: {uptime}\n"
         f"💬 Faol chatlar (joriy sessiyada): {len(chat_histories)}\n"
         f"📨 Qayta ishlangan xabarlar (joriy sessiyada): {stats['total_messages']}\n"
@@ -395,6 +459,21 @@ def call_groq_with_retry(create_fn, retries=1):
                 continue
     track_groq_result(success=False)
     raise last_exception
+
+
+FALLBACK_MESSAGES = {
+    "auto": "Kechirasiz, hozir texnik nosozlik yuz berdi 🙏 Bir ozdan so'ng qayta yozib ko'ring.",
+    "uz_latin": "Kechirasiz, hozir texnik nosozlik yuz berdi 🙏 Bir ozdan so'ng qayta yozib ko'ring.",
+    "uz_cyrillic": "Кечирасиз, ҳозир техник носозлик юз берди 🙏 Бир оздан сўнг қайта ёзиб кўринг.",
+    "en": "Sorry, I'm having a small technical hiccup right now 🙏 Please try again in a bit.",
+    "ru": "Извините, сейчас небольшие технические неполадки 🙏 Попробуйте написать чуть позже.",
+}
+
+
+def get_fallback_message(chat_id):
+    """Groq/API xato bergan holatda foydalanuvchi tanlagan tilga mos, iliqroq xabar qaytaradi."""
+    language_mode = chat_languages.get(chat_id, DEFAULT_LANGUAGE)
+    return FALLBACK_MESSAGES.get(language_mode, FALLBACK_MESSAGES["auto"])
 
 
 def get_ai_answer(chat_id, user_message_content, sender=None, user_name=None):
@@ -481,7 +560,7 @@ MULOQOT USLUBI:
         notify_error("Groq javob berishda", sender, chat_id, e)
         if chat_histories.get(chat_id) and chat_histories[chat_id][-1]["role"] == "user":
             chat_histories[chat_id].pop()
-        return "Keyinroq yozvoraman."
+        return get_fallback_message(chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +582,7 @@ def handle_callback_query(callback_query):
         lang_code = data.split(":", 1)[1]
         if lang_code in LANGUAGE_LABELS:
             chat_languages[chat_id] = lang_code
+            kv_save("chat_languages", chat_languages)
             answer_callback_query(callback_id, "Til o'zgartirildi ✅")
             if message_id:
                 edit_message_text(
@@ -584,6 +664,20 @@ def webhook():
         if is_rate_limited(chat_id):
             return "OK", 200
 
+        # --- ADMIN: /ismim BUYRUG'I ---
+        # Bu FAQAT admin uchun, ixtiyoriy: xohlagan vaqtda /ismim <ism> yozib
+        # o'z ismini o'rnatishi/o'zgartirishi mumkin. Majburiy so'rov emas -
+        # admin botga oddiy yozsa, bu bosqichda to'xtatilmaydi.
+        if is_admin(sender_id) and text and text.startswith("/ismim"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2 and parts[1].strip():
+                owner_name_state["name"] = parts[1].strip()
+                kv_save("owner_name", owner_name_state["name"])
+                send_message(chat_id, f"Ismingiz saqlandi: {owner_name_state['name']} ✅", business_connection_id)
+            else:
+                send_message(chat_id, "Ismingizni yozing, masalan: /ismim Jasur", business_connection_id)
+            return "OK", 200
+
         # --- YANGI FOYDALANUVCHIDAN ISMINI SO'RASH ---
         # Botga to'g'ridan-to'g'ri (business chat emas) birinchi marta yozgan va
         # admin bo'lmagan har bir kishidan avval ismini so'raymiz, shunda AI uni
@@ -594,6 +688,7 @@ def webhook():
                 if text and not text.startswith("/"):
                     new_name = text.strip()[:50]
                     user_names[chat_id] = new_name
+                    kv_save("user_names", user_names)
                     awaiting_name_chats.discard(chat_id)
                     send_message(chat_id, f"Xursandman, {new_name}! Endi savolingizni yozavering 🙂")
                 else:
@@ -608,31 +703,17 @@ def webhook():
                 )
                 return "OK", 200
 
-        # --- ADMIN BUYRUQLARI ---
+        # --- ADMIN BUYRUQLARI (faqat ism allaqachon o'rnatilgan bo'lsa keladi) ---
         if text and text.startswith("/") and is_admin(sender_id):
             if text == "/holat":
                 send_message(chat_id, get_status_text(), business_connection_id)
-                return "OK", 200
-
-            if text.startswith("/ismim"):
-                parts = text.split(maxsplit=1)
-                if len(parts) == 2 and parts[1].strip():
-                    owner_name_state["name"] = parts[1].strip()
-                    send_message(
-                        chat_id,
-                        f"Ismingiz saqlandi: {owner_name_state['name']} ✅\n"
-                        "Eslatma: bu Vercel qayta ishga tushganda (cold start) tiklanadi. "
-                        "Doimiy saqlash uchun OWNER_NAME muhit o'zgaruvchisiga ham shu ismni yozib qo'ying.",
-                        business_connection_id,
-                    )
-                else:
-                    send_message(chat_id, "Foydalanish: /ismim <ismingiz>\nMasalan: /ismim Jasur", business_connection_id)
                 return "OK", 200
 
             if text.startswith("/block"):
                 parts = text.split()
                 if len(parts) == 2 and parts[1].isdigit():
                     blocked_users.add(int(parts[1]))
+                    kv_save("blocked_users", list(blocked_users))
                     send_message(chat_id, f"Foydalanuvchi {parts[1]} bloklandi 🚫", business_connection_id)
                 else:
                     send_message(chat_id, "Foydalanish: /block <user_id>", business_connection_id)
@@ -642,6 +723,7 @@ def webhook():
                 parts = text.split()
                 if len(parts) == 2 and parts[1].isdigit():
                     blocked_users.discard(int(parts[1]))
+                    kv_save("blocked_users", list(blocked_users))
                     send_message(chat_id, f"Foydalanuvchi {parts[1]} blokdan chiqarildi ✅", business_connection_id)
                 else:
                     send_message(chat_id, "Foydalanish: /unblock <user_id>", business_connection_id)
@@ -660,10 +742,9 @@ def webhook():
                 if is_admin(sender_id) and not owner_name_state["name"]:
                     send_message(
                         chat_id,
-                        "Salom! Botni ishga tushirishdan oldin ismingizni kiriting, chunki bot "
-                        "sizga yozganlarga javob berganda o'zini tanishtirishda shu ismdan foydalanadi "
-                        "(masalan: \"men Jasurning AI-yordamchisiman\").\n\n"
-                        "Yozing: /ismim <ismingiz>\nMasalan: /ismim Jasur",
+                        "Salom! /yordam yozsangiz nima qila olishimni ko'rasiz.\n\n"
+                        "Eslatma: ismingiz hali kiritilmagan — istasangiz /ismim Jasur "
+                        "kabi yozib qo'ying, shunda bot suhbatlarda shu ismdan foydalanadi.",
                         business_connection_id,
                     )
                     return "OK", 200
@@ -688,14 +769,17 @@ def webhook():
 
             if text == "/hazil":
                 chat_moods[chat_id] = "hazil"
+                kv_save("chat_moods", chat_moods)
                 send_message(chat_id, "Bo'ldi, endi hazillashib gaplashamiz! 😄", business_connection_id)
                 return "OK", 200
             elif text == "/jiddiy":
                 chat_moods[chat_id] = "jiddiy"
+                kv_save("chat_moods", chat_moods)
                 send_message(chat_id, "Tushunarli, jiddiy rejimga o'tdik.", business_connection_id)
                 return "OK", 200
             elif text == "/normal":
                 chat_moods[chat_id] = "normal"
+                kv_save("chat_moods", chat_moods)
                 send_message(chat_id, "Odatdagi holatga qaytdik.", business_connection_id)
                 return "OK", 200
 
